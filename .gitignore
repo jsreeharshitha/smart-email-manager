@@ -9,3 +9,5 @@ dist/
 *.egg-info/
 .vscode/
 .idea/
+credentials.json
+token.json
