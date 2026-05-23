@@ -1,0 +1,23 @@
+smart-email-manager/
+│
+├── config/                  # Environment & connection management
+│   ├── __init__.py
+│   └── settings.py          # Loaded variables (MongoDB URI, Gemini Keys)
+│
+├── db/                      # Database interface layer
+│   ├── __init__.py
+│   └── mongo_client.py      # MongoDB connections and change streams
+│
+├── tools/                   # The core execution capabilities of your agent
+│   ├── __init__.py
+│   ├── gmail_mcp.py         # Gmail read/write functions decorated as tools
+│   └── database_ops.py      # MongoDB write operations decorated as tools
+│
+├── deploy/                  # NEW: Agent Builder Deployment Configuration
+│   ├── Dockerfile           # Packages your ADK runtime environment
+│   └── agent_config.yaml    # Configures Agent Engine scaling and environment vars
+│
+├── agent.py                 # Core ADK initialization and loop orchestration
+├── main.py                  # API entrypoint (FastAPI / Cloud Run wrapper)
+├── requirements.txt         # Runtime system dependencies
+└── README.md                # Component setup documentation
