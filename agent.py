@@ -8,7 +8,7 @@ def process_email(email_metadata: dict, email_body: str):
     """
     # 1. Generate embedding
     embedding = generate_embedding(email_body)
-    
+
     # 2. Prepare document
     document = {
         **email_metadata,
@@ -17,17 +17,44 @@ def process_email(email_metadata: dict, email_body: str):
         "email_semantic_score": 0.0,
         "processed_at": datetime.now(UTC)
     }
-    
+
     # 3. Store in database
     return store_email_record(document)
 
+def search_and_group_emails(target_group: str):
+    """
+    Finds unclassified emails that semantically match a target group.
+    """
+    print(f"\nSearching for emails matching the group: '{target_group}'...")
+
+    # 1. Embed the target group phrase
+    query_embedding = generate_embedding(target_group, model="voyage-3")
+
+    # 2. Perform vector search with pre-filtering
+    from tools.database_ops import find_unclassified_by_semantic_group
+    results = find_unclassified_by_semantic_group(query_embedding)
+
+    # 3. Display results
+    if not results:
+        print("No matching unclassified emails found.")
+        return
+
+    print(f"Found {len(results)} matches:")
+    for doc in results:
+        print(f"- [{doc['score']:.4f}] {doc.get('subject', 'No Subject')} (from: {doc.get('sender', 'Unknown')})")
+
 if __name__ == "__main__":
-    # Example usage
+    # Example usage: Processing an email
     sample_metadata = {
-        "subject": "Hackathon Project Update : 1 2 3",
-        "sender": "friend@example.com",
+        "subject": "Invoicing Question",
+        "sender": "billing@corp.com",
         "date": datetime.now(UTC).isoformat()
     }
-    sample_body = "The new email delivery system is ready. Now we need to process the text and store the vector embeddings."
-    
+    sample_body = "Can you please send me the invoice for the last quarter?"
+
+    # Store a sample email
     process_email(sample_metadata, sample_body)
+
+    # Demonstrate the semantic search/grouping
+    search_and_group_emails("financial documents")
+
