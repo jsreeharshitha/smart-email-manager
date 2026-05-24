@@ -32,10 +32,10 @@ async def mongodb_status(user_email: str):
     return {"status": "disconnected", "logged_in": False}
 
 @app.get("/mongodb/login")
-async def mongodb_login(user_email: str):
+async def mongodb_login(request: Request, user_email: str):
     """Initiates the MongoDB OAuth flow (Mocked for Hackathon)."""
-    # Pointing to a mock callback for demonstration to avoid 401 invalid_client errors
-    base_url = os.getenv("CLOUD_RUN_URL", "http://localhost:8080")
+    # Dynamically determine the base URL from the request to avoid localhost issues
+    base_url = str(request.base_url).rstrip('/')
     auth_url = f"{base_url}/callback?state={user_email}&code=hackathon_success"
     return {"auth_url": auth_url}
 
