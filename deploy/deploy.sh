@@ -4,15 +4,25 @@
 PROJECT_ID=$(gcloud config get-value project)
 SERVICE_NAME="smart-email-manager-agent"
 REGION="us-central1"
-IMAGE_NAME="gcr.io/$PROJECT_ID/$SERVICE_NAME"
+REPO_NAME="agent-repo"
+IMAGE_NAME="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$SERVICE_NAME"
 
 echo "🚀 Starting deployment for $SERVICE_NAME..."
 
-# 1. Build the image using Cloud Build
+# 1. Create Artifact Registry repository if it doesn't exist
+echo "🛠️ Ensuring Artifact Registry repository exists..."
+gcloud artifacts repositories create $REPO_NAME \
+  --repository-format=docker \
+  --location=$REGION \
+  --description="Docker repository for Rapid Agent Gmail Suite" \
+  --project $PROJECT_ID \
+  2>/dev/null || true
+
+# 2. Build the image using Cloud Build
 echo "📦 Building container image..."
 gcloud builds submit --tag $IMAGE_NAME . --project $PROJECT_ID
 
-# 2. Deploy to Cloud Run
+# 3. Deploy to Cloud Run
 echo "🚢 Deploying to Cloud Run..."
 gcloud run deploy $SERVICE_NAME \
   --image $IMAGE_NAME \
