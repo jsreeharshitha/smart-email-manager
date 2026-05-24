@@ -18,7 +18,7 @@ gcloud run deploy $ServiceName `
   --region $Region `
   --allow-unauthenticated `
   --port 8080 `
-  --set-env-vars="PROJECT_ID=$ProjectId" `
+  --set-env-vars="PROJECT_ID=$ProjectId,MONGO_URI=mongodb+srv://rahulgputcha_db_user:kRNlVZ9FmHovmAHi@personalemailmanager-md.p9mjsu8.mongodb.net/?appName=PersonalEmailManager-MDBCluster,VOYAGE_API_KEY=pa-V-Bk90sYKKs3sNbb1DUzn7Z2DID7ZttqLlzsSQW_tSk" `
   --project $ProjectId
 
 $ServiceUrl = $(gcloud run services describe $ServiceName --platform managed --region $Region --format 'value(status.url)')
