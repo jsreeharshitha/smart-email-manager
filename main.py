@@ -33,9 +33,18 @@ async def mongodb_status(user_email: str):
 
 @app.get("/mongodb/login")
 async def mongodb_login(user_email: str):
-    """Initiates the MongoDB OAuth flow."""
-    auth_url = logintoMongoDB_OAuth(user_email)
+    """Initiates the MongoDB OAuth flow (Mocked for Hackathon)."""
+    # Pointing to a mock callback for demonstration to avoid 401 invalid_client errors
+    base_url = os.getenv("CLOUD_RUN_URL", "http://localhost:8080")
+    auth_url = f"{base_url}/callback?state={user_email}&code=hackathon_success"
     return {"auth_url": auth_url}
+
+@app.get("/mongodb/register")
+async def mongodb_register(user_email: str):
+    """Redirects the user to MongoDB Atlas to create an account/cluster."""
+    # Official MongoDB Atlas Registration URL
+    register_url = "https://www.mongodb.com/cloud/atlas/register"
+    return {"register_url": register_url}
 
 @app.get("/callback")
 async def oauth_callback(state: str, code: str = "placeholder_code"):
