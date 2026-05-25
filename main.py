@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 import os
 from db.mongo_client import get_client
 from config import settings
@@ -34,10 +34,39 @@ async def mongodb_status(user_email: str):
 @app.get("/mongodb/login")
 async def mongodb_login(request: Request, user_email: str):
     """Initiates the MongoDB OAuth flow (Mocked for Hackathon)."""
-    # Dynamically determine the base URL from the request to avoid localhost issues
-    base_url = str(request.base_url).rstrip('/')
-    auth_url = f"{base_url}/callback?state={user_email}&code=hackathon_success"
+    # Use Host header which is reliable on Cloud Run to avoid localhost issues
+    host = request.headers.get("host", "localhost:8080")
+    scheme = request.headers.get("x-forwarded-proto", "https")
+    auth_url = f"{scheme}://{host}/auth?state={user_email}"
     return {"auth_url": auth_url}
+
+@app.get("/auth")
+async def auth_page(state: str):
+    """Serves a branded mock MongoDB authorization page."""
+    html_content = f"""
+    <html>
+        <head>
+            <title>MongoDB Login Simulation</title>
+            <style>
+                body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; text-align: center; padding-top: 100px; background-color: #f9f9f9; color: #001e2b; }}
+                .card {{ background: white; padding: 40px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 400px; }}
+                .btn {{ background: #00ed64; color: #001e2b; padding: 15px 30px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block; margin-top: 20px; transition: background 0.2s; }}
+                .btn:hover {{ background: #00c654; }}
+                .logo {{ background: #001e2b; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <img src="https://webassets.mongodb.com/_com_assets/cms/mongodb_logo_white_v2-9602e60.png" width="180" class="logo">
+                <h2>Sign in to MongoDB</h2>
+                <p>Connect your Atlas account for:<br><b>{state}</b></p>
+                <a href="/callback?state={state}&code=hackathon_success" class="btn">Authorize Connection</a>
+                <p style="font-size: 12px; color: #888; margin-top: 30px;">(Hackathon Simulation Mode)</p>
+            </div>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content, status_code=200)
 
 @app.get("/mongodb/register")
 async def mongodb_register(user_email: str):
@@ -55,7 +84,14 @@ async def oauth_callback(state: str, code: str = "placeholder_code"):
         "connected": True,
         "tokens": {"access_token": "fake_token_" + code}
     }
-    return {"message": f"Successfully authenticated for {user_email}. You can now close this tab and return to the Gmail Sidebar."}
+    return HTMLResponse(content=f"""
+    <html>
+        <body style="font-family: sans-serif; text-align: center; padding-top: 100px;">
+            <h1 style="color: #00ed64;">✓ Successfully Authenticated</h1>
+            <p>You can now close this tab and return to your Gmail Sidebar.</p>
+        </body>
+    </html>
+    """)
 
 @app.get("/")
 async def root():
