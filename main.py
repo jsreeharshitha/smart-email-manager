@@ -46,26 +46,38 @@ async def mongodb_login(request: Request, user_email: str, base_url: str = None)
 
 @app.get("/auth")
 async def auth_page(state: str):
-    """Serves a branded mock MongoDB authorization page."""
+    """Serves a professional 'Sign in with Google' simulation for MongoDB."""
+    user_email = state
     html_content = f"""
     <html>
         <head>
-            <title>MongoDB Login Simulation</title>
+            <title>Sign in - MongoDB Atlas</title>
             <style>
-                body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; text-align: center; padding-top: 100px; background-color: #f9f9f9; color: #001e2b; }}
-                .card {{ background: white; padding: 40px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 400px; }}
-                .btn {{ background: #00ed64; color: #001e2b; padding: 15px 30px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block; margin-top: 20px; transition: background 0.2s; }}
-                .btn:hover {{ background: #00c654; }}
-                .logo {{ background: #001e2b; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
+                body {{ font-family: 'Roboto', arial, sans-serif; background-color: #fff; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }}
+                .container {{ border: 1px solid #dadce0; border-radius: 8px; width: 450px; padding: 48px 40px 36px; text-align: center; }}
+                .logo {{ width: 120px; margin-bottom: 24px; }}
+                h1 {{ font-size: 24px; font-weight: 400; margin-bottom: 8px; }}
+                p {{ color: #202124; font-size: 16px; margin-bottom: 32px; }}
+                .user-box {{ border: 1px solid #dadce0; border-radius: 20px; display: inline-flex; align-items: center; padding: 5px 15px; margin-bottom: 30px; }}
+                .user-icon {{ background: #4285f4; color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; margin-right: 10px; }}
+                .btn {{ background-color: #001e2b; color: white; border: none; border-radius: 4px; padding: 10px 24px; font-size: 14px; font-weight: 500; cursor: pointer; text-decoration: none; display: block; }}
+                .btn:hover {{ background-color: #00303e; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }}
+                .footer {{ color: #70757a; font-size: 12px; margin-top: 40px; }}
             </style>
         </head>
         <body>
-            <div class="card">
-                <img src="https://webassets.mongodb.com/_com_assets/cms/mongodb_logo_white_v2-9602e60.png" width="180" class="logo">
-                <h2>Sign in to MongoDB</h2>
-                <p>Connect your Atlas account for:<br><b>{state}</b></p>
-                <a href="/callback?state={state}&code=hackathon_success" class="btn">Authorize Connection</a>
-                <p style="font-size: 12px; color: #888; margin-top: 30px;">(Hackathon Simulation Mode)</p>
+            <div class="container">
+                <img src="https://webassets.mongodb.com/_com_assets/cms/mongodb_logo_white_v2-9602e60.png" class="logo" style="background: #001e2b; padding: 10px; border-radius: 4px;">
+                <h1>Sign in</h1>
+                <p>to continue to Rapid Agent Gmail Suite</p>
+                <div class="user-box">
+                    <div class="user-icon">{user_email[0].upper()}</div>
+                    <span>{user_email}</span>
+                </div>
+                <a href="/callback?state={user_email}&code=google_oauth_success" class="btn">Continue as {user_email.split('@')[0]}</a>
+                <div class="footer">
+                    MongoDB Atlas uses your Google identity to securely connect<br>to your email management clusters.
+                </div>
             </div>
         </body>
     </html>
