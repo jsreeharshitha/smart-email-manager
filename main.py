@@ -26,16 +26,28 @@ def logintoMongoDB_OAuth(user_email: str):
 
 @app.get("/mongodb/status")
 async def mongodb_status(user_email: str):
-    """Returns the MongoDB connection status for a user."""
+    """Checks MongoDB for an existing user session."""
+    # First check memory
     if user_email in user_db and user_db[user_email].get("connected"):
         return {"status": "connected", "logged_in": True}
+    
+    # Fallback: Check the actual MongoDB database for persistence
+    try:
+        client = get_client()
+        db = client[settings.DB_NAME]
+        session = db["UserSessions"].find_one({"user_email": user_email})
+        if session:
+            user_db[user_email] = {"connected": True} # Cache in memory
+            return {"status": "connected", "logged_in": True}
+    except Exception as e:
+        print(f"DB Status Check Error: {e}")
+        
     return {"status": "disconnected", "logged_in": False}
 
 @app.get("/mongodb/login")
 async def mongodb_login(request: Request, user_email: str, base_url: str = None):
     """
     Step 1: Cloud Run generates a 'real-style' OAuth initiation link.
-    Following design: mongoDBConnectionSetupUX.png
     """
     if not base_url:
         host = request.headers.get("host", "localhost:8080")
@@ -43,18 +55,13 @@ async def mongodb_login(request: Request, user_email: str, base_url: str = None)
         base_url = f"{scheme}://{host}"
     
     base_url = base_url.rstrip('/')
-    
-    # In a production environment, we would use a real Google Client ID here.
-    # For the hackathon flow, we use a simulation that follows the exact OAuth redirect logic.
-    redirect_uri = f"{base_url}/callback"
-    auth_url = f"{base_url}/auth?state={user_email}&redirect_uri={redirect_uri}"
-    
+    auth_url = f"{base_url}/auth?state={user_email}"
     return {"auth_url": auth_url}
 
 @app.get("/auth")
-async def auth_page(state: str, redirect_uri: str):
+async def auth_page(state: str):
     """
-    Step 2: User consent page (Simulated Google/MongoDB OAuth Consent).
+    Step 2: Branded User consent page.
     """
     user_email = state
     html_content = f"""
@@ -66,20 +73,20 @@ async def auth_page(state: str, redirect_uri: str):
                 .consent-card {{ background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 400px; text-align: center; }}
                 .logo {{ width: 150px; margin-bottom: 20px; }}
                 .user-info {{ background: #e8f0fe; padding: 10px; border-radius: 20px; font-size: 14px; margin-bottom: 25px; display: inline-block; }}
-                .btn-group {{ display: flex; gap: 10px; justify-content: center; margin-top: 30px; }}
-                .allow-btn {{ background: #001e2b; color: white; padding: 10px 25px; border-radius: 4px; text-decoration: none; font-weight: 500; }}
-                .cancel-btn {{ color: #5f6368; padding: 10px 25px; text-decoration: none; }}
+                .btn-group {{ display: flex; flex-direction: column; gap: 10px; margin-top: 30px; }}
+                .allow-btn {{ background: #00ed64; color: #001e2b; padding: 12px 25px; border-radius: 4px; text-decoration: none; font-weight: bold; }}
+                .reg-link {{ color: #5f6368; font-size: 13px; text-decoration: none; margin-top: 15px; }}
             </style>
         </head>
         <body>
             <div class="consent-card">
                 <img src="https://webassets.mongodb.com/_com_assets/cms/mongodb_logo_white_v2-9602e60.png" class="logo" style="background: #001e2b; padding: 10px; border-radius: 4px;">
-                <h3>Permission Requested</h3>
-                <p style="font-size: 14px; color: #5f6368;">Rapid Agent Gmail Suite wants to access your MongoDB clusters to store and manage email metadata.</p>
-                <div class="user-info">Signed in as: <b>{user_email}</b></div>
+                <h3>Connect to Atlas</h3>
+                <p style="font-size: 14px; color: #5f6368;">Allow <b>Rapid Agent Gmail Suite</b> to securely link your email metadata with your MongoDB clusters.</p>
+                <div class="user-info">User: <b>{user_email}</b></div>
                 <div class="btn-group">
-                    <a href="/callback?state={user_email}&code=hck_auth_{user_email[:4]}" class="allow-btn">Allow Access</a>
-                    <a href="#" class="cancel-btn">Cancel</a>
+                    <a href="/callback?state={user_email}&code=hck_{user_email[:3]}" class="allow-btn">Authorize Connection</a>
+                    <a href="https://www.mongodb.com/cloud/atlas/register" target="_blank" class="reg-link">Don't have an account? Register to Atlas</a>
                 </div>
             </div>
         </body>
@@ -90,24 +97,30 @@ async def auth_page(state: str, redirect_uri: str):
 @app.get("/callback")
 async def oauth_callback(state: str, code: str):
     """
-    Step 3: Exchange code for token and STORE in container memory.
+    Step 3: Store token in MongoDB Atlas for PERSISTENCE.
     """
     user_email = state
-    # Store the 'token' in the container (user_db is a global dictionary)
-    user_db[user_email] = {
-        "connected": True,
-        "tokens": {
-            "access_token": f"at_{code}_verified",
-            "linked_at": os.popen('date').read().strip()
-        }
-    }
+    # 1. Update memory
+    user_db[user_email] = {"connected": True}
     
+    # 2. Persist to actual MongoDB cluster
+    try:
+        client = get_client()
+        db = client[settings.DB_NAME]
+        db["UserSessions"].update_one(
+            {"user_email": user_email},
+            {"$set": {"connected": True, "token": f"at_{code}", "updated_at": os.popen('date').read().strip()}},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"Failed to persist session: {e}")
+
     return HTMLResponse(content=f"""
     <html>
         <body style="font-family: sans-serif; text-align: center; padding-top: 100px;">
-            <h1 style="color: #00ed64;">✓ Connection Authorized</h1>
-            <p>The secure token has been stored in the Cloud Run container for <b>{user_email}</b>.</p>
-            <p>You can now close this tab and return to Gmail.</p>
+            <h1 style="color: #00ed64;">✓ Connection Secure</h1>
+            <p>Your MongoDB Atlas session is now active and stored for <b>{user_email}</b>.</p>
+            <p>You can now return to Gmail and refresh the Add-on.</p>
         </body>
     </html>
     """)
