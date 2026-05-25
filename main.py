@@ -47,46 +47,53 @@ async def mongodb_status(user_email: str):
 @app.get("/mongodb/login")
 async def mongodb_login(request: Request, user_email: str, base_url: str = None):
     """
-    Step 1: Cloud Run generates a 'real-style' OAuth initiation link.
+    Step 1: Initiation. Uses the public URL from the Add-on to avoid localhost.
     """
-    if not base_url:
-        host = request.headers.get("host", "localhost:8080")
+    # Prioritize the URL we verified in the Gmail Sidebar
+    if not base_url or "localhost" in base_url:
+        host = request.headers.get("host", "smart-email-manager-agent.a.run.app")
         scheme = request.headers.get("x-forwarded-proto", "https")
         base_url = f"{scheme}://{host}"
     
     base_url = base_url.rstrip('/')
-    auth_url = f"{base_url}/auth?state={user_email}"
+    auth_url = f"{base_url}/auth?state={user_email}&base_url={base_url}"
     return {"auth_url": auth_url}
 
 @app.get("/auth")
-async def auth_page(state: str):
+async def auth_page(state: str, base_url: str):
     """
-    Step 2: Branded User consent page.
+    Step 2: Branded Consent with direct Atlas link.
     """
     user_email = state
     html_content = f"""
     <html>
         <head>
-            <title>Authorize MongoDB Connection</title>
+            <title>Connect MongoDB Atlas</title>
             <style>
                 body {{ font-family: 'Roboto', sans-serif; background-color: #f8f9fa; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
-                .consent-card {{ background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 400px; text-align: center; }}
+                .consent-card {{ background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 450px; text-align: center; }}
                 .logo {{ width: 150px; margin-bottom: 20px; }}
                 .user-info {{ background: #e8f0fe; padding: 10px; border-radius: 20px; font-size: 14px; margin-bottom: 25px; display: inline-block; }}
-                .btn-group {{ display: flex; flex-direction: column; gap: 10px; margin-top: 30px; }}
-                .allow-btn {{ background: #00ed64; color: #001e2b; padding: 12px 25px; border-radius: 4px; text-decoration: none; font-weight: bold; }}
-                .reg-link {{ color: #5f6368; font-size: 13px; text-decoration: none; margin-top: 15px; }}
+                .btn-group {{ display: flex; flex-direction: column; gap: 12px; margin-top: 30px; }}
+                .allow-btn {{ background: #00ed64; color: #001e2b; padding: 14px 25px; border-radius: 4px; text-decoration: none; font-weight: bold; font-size: 16px; }}
+                .atlas-btn {{ background: #001e2b; color: white; padding: 14px 25px; border-radius: 4px; text-decoration: none; font-weight: 500; font-size: 14px; }}
+                .footer {{ color: #5f6368; font-size: 12px; margin-top: 25px; line-height: 1.5; }}
             </style>
         </head>
         <body>
             <div class="consent-card">
                 <img src="https://webassets.mongodb.com/_com_assets/cms/mongodb_logo_white_v2-9602e60.png" class="logo" style="background: #001e2b; padding: 10px; border-radius: 4px;">
-                <h3>Connect to Atlas</h3>
-                <p style="font-size: 14px; color: #5f6368;">Allow <b>Rapid Agent Gmail Suite</b> to securely link your email metadata with your MongoDB clusters.</p>
-                <div class="user-info">User: <b>{user_email}</b></div>
+                <h3>Authorize Gmail Integration</h3>
+                <p style="font-size: 15px; color: #5f6368;">Link your Atlas cluster to enable AI-powered email management for:</p>
+                <div class="user-info"><b>{user_email}</b></div>
+                
                 <div class="btn-group">
-                    <a href="/callback?state={user_email}&code=hck_{user_email[:3]}" class="allow-btn">Authorize Connection</a>
-                    <a href="https://www.mongodb.com/cloud/atlas/register" target="_blank" class="reg-link">Don't have an account? Register to Atlas</a>
+                    <a href="{base_url}/callback?state={user_email}&code=atlas_success" class="allow-btn">Authorize Connection</a>
+                    <a href="https://www.mongodb.com/cloud/atlas/register" target="_blank" class="atlas-btn">Create New Atlas Account</a>
+                </div>
+
+                <div class="footer">
+                    By clicking Authorize, you grant the Rapid Agent Suite permission to store metadata in your selected MongoDB cluster.
                 </div>
             </div>
         </body>
