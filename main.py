@@ -33,50 +33,53 @@ async def mongodb_status(user_email: str):
 
 @app.get("/mongodb/login")
 async def mongodb_login(request: Request, user_email: str, base_url: str = None):
-    """Initiates the MongoDB OAuth flow (Mocked for Hackathon)."""
-    # Use the base_url provided by the client (Gmail Add-on) or detect it
+    """
+    Step 1: Cloud Run generates a 'real-style' OAuth initiation link.
+    Following design: mongoDBConnectionSetupUX.png
+    """
     if not base_url:
         host = request.headers.get("host", "localhost:8080")
         scheme = request.headers.get("x-forwarded-proto", "https")
         base_url = f"{scheme}://{host}"
     
     base_url = base_url.rstrip('/')
-    auth_url = f"{base_url}/auth?state={user_email}"
+    
+    # In a production environment, we would use a real Google Client ID here.
+    # For the hackathon flow, we use a simulation that follows the exact OAuth redirect logic.
+    redirect_uri = f"{base_url}/callback"
+    auth_url = f"{base_url}/auth?state={user_email}&redirect_uri={redirect_uri}"
+    
     return {"auth_url": auth_url}
 
 @app.get("/auth")
-async def auth_page(state: str):
-    """Serves a professional 'Sign in with Google' simulation for MongoDB."""
+async def auth_page(state: str, redirect_uri: str):
+    """
+    Step 2: User consent page (Simulated Google/MongoDB OAuth Consent).
+    """
     user_email = state
     html_content = f"""
     <html>
         <head>
-            <title>Sign in - MongoDB Atlas</title>
+            <title>Authorize MongoDB Connection</title>
             <style>
-                body {{ font-family: 'Roboto', arial, sans-serif; background-color: #fff; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }}
-                .container {{ border: 1px solid #dadce0; border-radius: 8px; width: 450px; padding: 48px 40px 36px; text-align: center; }}
-                .logo {{ width: 120px; margin-bottom: 24px; }}
-                h1 {{ font-size: 24px; font-weight: 400; margin-bottom: 8px; }}
-                p {{ color: #202124; font-size: 16px; margin-bottom: 32px; }}
-                .user-box {{ border: 1px solid #dadce0; border-radius: 20px; display: inline-flex; align-items: center; padding: 5px 15px; margin-bottom: 30px; }}
-                .user-icon {{ background: #4285f4; color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; margin-right: 10px; }}
-                .btn {{ background-color: #001e2b; color: white; border: none; border-radius: 4px; padding: 10px 24px; font-size: 14px; font-weight: 500; cursor: pointer; text-decoration: none; display: block; }}
-                .btn:hover {{ background-color: #00303e; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }}
-                .footer {{ color: #70757a; font-size: 12px; margin-top: 40px; }}
+                body {{ font-family: 'Roboto', sans-serif; background-color: #f8f9fa; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+                .consent-card {{ background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 400px; text-align: center; }}
+                .logo {{ width: 150px; margin-bottom: 20px; }}
+                .user-info {{ background: #e8f0fe; padding: 10px; border-radius: 20px; font-size: 14px; margin-bottom: 25px; display: inline-block; }}
+                .btn-group {{ display: flex; gap: 10px; justify-content: center; margin-top: 30px; }}
+                .allow-btn {{ background: #001e2b; color: white; padding: 10px 25px; border-radius: 4px; text-decoration: none; font-weight: 500; }}
+                .cancel-btn {{ color: #5f6368; padding: 10px 25px; text-decoration: none; }}
             </style>
         </head>
         <body>
-            <div class="container">
+            <div class="consent-card">
                 <img src="https://webassets.mongodb.com/_com_assets/cms/mongodb_logo_white_v2-9602e60.png" class="logo" style="background: #001e2b; padding: 10px; border-radius: 4px;">
-                <h1>Sign in</h1>
-                <p>to continue to Rapid Agent Gmail Suite</p>
-                <div class="user-box">
-                    <div class="user-icon">{user_email[0].upper()}</div>
-                    <span>{user_email}</span>
-                </div>
-                <a href="/callback?state={user_email}&code=google_oauth_success" class="btn">Continue as {user_email.split('@')[0]}</a>
-                <div class="footer">
-                    MongoDB Atlas uses your Google identity to securely connect<br>to your email management clusters.
+                <h3>Permission Requested</h3>
+                <p style="font-size: 14px; color: #5f6368;">Rapid Agent Gmail Suite wants to access your MongoDB clusters to store and manage email metadata.</p>
+                <div class="user-info">Signed in as: <b>{user_email}</b></div>
+                <div class="btn-group">
+                    <a href="/callback?state={user_email}&code=hck_auth_{user_email[:4]}" class="allow-btn">Allow Access</a>
+                    <a href="#" class="cancel-btn">Cancel</a>
                 </div>
             </div>
         </body>
@@ -84,27 +87,27 @@ async def auth_page(state: str):
     """
     return HTMLResponse(content=html_content, status_code=200)
 
-@app.get("/mongodb/register")
-async def mongodb_register(user_email: str):
-    """Redirects the user to MongoDB Atlas to create an account/cluster."""
-    # Official MongoDB Atlas Registration URL
-    register_url = "https://www.mongodb.com/cloud/atlas/register"
-    return {"register_url": register_url}
-
 @app.get("/callback")
-async def oauth_callback(state: str, code: str = "placeholder_code"):
-    """Callback for the OAuth flow."""
+async def oauth_callback(state: str, code: str):
+    """
+    Step 3: Exchange code for token and STORE in container memory.
+    """
     user_email = state
-    # Mark user as connected
+    # Store the 'token' in the container (user_db is a global dictionary)
     user_db[user_email] = {
         "connected": True,
-        "tokens": {"access_token": "fake_token_" + code}
+        "tokens": {
+            "access_token": f"at_{code}_verified",
+            "linked_at": os.popen('date').read().strip()
+        }
     }
+    
     return HTMLResponse(content=f"""
     <html>
         <body style="font-family: sans-serif; text-align: center; padding-top: 100px;">
-            <h1 style="color: #00ed64;">✓ Successfully Authenticated</h1>
-            <p>You can now close this tab and return to your Gmail Sidebar.</p>
+            <h1 style="color: #00ed64;">✓ Connection Authorized</h1>
+            <p>The secure token has been stored in the Cloud Run container for <b>{user_email}</b>.</p>
+            <p>You can now close this tab and return to Gmail.</p>
         </body>
     </html>
     """)
