@@ -1,8 +1,11 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
+from fastapi import FastAPI, Request, Body
+from fastapi.responses import HTMLResponse
 import os
 from db.mongo_client import get_client
 from config import settings
+from agent import process_email
+from tools.mongo_mcp import get_last_sync_timestamp, setup_database
+from typing import List, Optional
 
 app = FastAPI()
 
@@ -43,6 +46,35 @@ async def mongodb_status(user_email: str):
         print(f"DB Status Check Error: {e}")
         
     return {"status": "disconnected", "logged_in": False}
+
+@app.get("/mongodb/last_sync")
+async def get_last_sync(user_email: str):
+    """Retrieves the timestamp of the last synced email for a user."""
+    timestamp = get_last_sync_timestamp(user_email)
+    if timestamp and timestamp != "None":
+        return {"last_sync": timestamp}
+    return {"last_sync": None}
+
+@app.post("/mongodb/sync")
+async def sync_emails(user_email: str, emails: List[dict] = Body(...)):
+    """Processes and stores a batch of emails."""
+    results = []
+    for email in emails:
+        try:
+            metadata = {
+                "subject": email.get("subject"),
+                "sender": email.get("sender"),
+                "date": email.get("date"),
+                "message_id": email.get("message_id"),
+                "user_email": user_email
+            }
+            body = email.get("body", "")
+            doc_id = process_email(metadata, body)
+            results.append({"message_id": email.get("message_id"), "status": "success", "id": str(doc_id)})
+        except Exception as e:
+            results.append({"message_id": email.get("message_id"), "status": "error", "error": str(e)})
+    
+    return {"results": results}
 
 @app.get("/mongodb/login")
 async def mongodb_login(request: Request, user_email: str, base_url: str = None):
@@ -105,6 +137,7 @@ async def auth_page(state: str, base_url: str):
 async def oauth_callback(state: str, code: str):
     """
     Step 3: Store token in MongoDB Atlas for PERSISTENCE.
+    Also triggers an automated database and index setup.
     """
     user_email = state
     # 1. Update memory
@@ -119,14 +152,20 @@ async def oauth_callback(state: str, code: str):
             {"$set": {"connected": True, "token": f"at_{code}", "updated_at": os.popen('date').read().strip()}},
             upsert=True
         )
+
+        # 3. Trigger Agent Setup (Database & Vector Index)
+        setup_status = setup_database()
+        print(f"Setup Status for {user_email}: {setup_status}")
+
     except Exception as e:
-        print(f"Failed to persist session: {e}")
+        print(f"Failed to persist session or setup DB: {e}")
 
     return HTMLResponse(content=f"""
     <html>
         <body style="font-family: sans-serif; text-align: center; padding-top: 100px;">
             <h1 style="color: #00ed64;">✓ Connection Secure</h1>
             <p>Your MongoDB Atlas session is now active and stored for <b>{user_email}</b>.</p>
+            <p>The database cluster and vector search indexes are being prepared.</p>
             <p>You can now return to Gmail and refresh the Add-on.</p>
         </body>
     </html>
