@@ -32,12 +32,16 @@ async def mongodb_status(user_email: str):
     return {"status": "disconnected", "logged_in": False}
 
 @app.get("/mongodb/login")
-async def mongodb_login(request: Request, user_email: str):
+async def mongodb_login(request: Request, user_email: str, base_url: str = None):
     """Initiates the MongoDB OAuth flow (Mocked for Hackathon)."""
-    # Use Host header which is reliable on Cloud Run to avoid localhost issues
-    host = request.headers.get("host", "localhost:8080")
-    scheme = request.headers.get("x-forwarded-proto", "https")
-    auth_url = f"{scheme}://{host}/auth?state={user_email}"
+    # Use the base_url provided by the client (Gmail Add-on) or detect it
+    if not base_url:
+        host = request.headers.get("host", "localhost:8080")
+        scheme = request.headers.get("x-forwarded-proto", "https")
+        base_url = f"{scheme}://{host}"
+    
+    base_url = base_url.rstrip('/')
+    auth_url = f"{base_url}/auth?state={user_email}"
     return {"auth_url": auth_url}
 
 @app.get("/auth")
