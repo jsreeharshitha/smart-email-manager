@@ -53,10 +53,10 @@ async def setup_mongodb_backend(setup_request: MongoSetupRequest):
         
         org_id = org_data["results"][0]["id"]
         
-        # 2. Create Project
+        # 2. Create Project (Linked to the discovered Organization)
         project_name = f"Rapid-Agent-Suite-{uuid.uuid4().hex[:6]}"
         project_payload = {"name": project_name}
-        project_res = requests.post("https://cloud.mongodb.com/api/atlas/v2/groups", 
+        project_res = requests.post(f"https://cloud.mongodb.com/api/atlas/v2/orgs/{org_id}/groups", 
                                     auth=auth, headers=headers, json=project_payload)
         
         if project_res.status_code not in [200, 201]:
