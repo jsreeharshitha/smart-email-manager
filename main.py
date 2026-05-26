@@ -173,7 +173,10 @@ async def oauth_callback(state: str, code: str):
 
 @app.get("/")
 async def root():
-    return {"message": "Smart Email Manager Agent is running."}
+    return {
+        "message": "Smart Email Manager Agent is running.",
+        "project_id": os.environ.get("PROJECT_ID", "unknown")
+    }
 
 if __name__ == "__main__":
     import uvicorn
