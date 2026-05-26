@@ -9,3 +9,5 @@ fastapi
 uvicorn
 pydantic
 google-adk
+requests
+google-cloud-secret-manager

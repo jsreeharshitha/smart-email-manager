@@ -1,13 +1,121 @@
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request, Body, HTTPException
 from fastapi.responses import HTMLResponse
 import os
+import requests
+from requests.auth import HTTPDigestAuth
+import json
+import uuid
+import string
+import random
 from db.mongo_client import get_client
 from config import settings
 from agent import process_email
 from tools.mongo_mcp import get_last_sync_timestamp, setup_database
 from typing import List, Optional
+from pydantic import BaseModel
 
 app = FastAPI()
+
+class MongoSetupRequest(BaseModel):
+    mongo_public_key: str
+    mongo_private_key: str
+    user_email: str
+
+def generate_secure_password(length=16):
+    characters = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(random.choice(characters) for i in range(length))
+
+@app.post("/api/setup-db")
+async def setup_mongodb_backend(setup_request: MongoSetupRequest):
+    """
+    Automated MongoDB Atlas Provisioning Wizard.
+    Phases: 1. Project Creation, 2. IP Whitelisting, 3. DB User Creation, 4. Cluster Launch.
+    """
+    public_key = setup_request.mongo_public_key
+    private_key = setup_request.mongo_private_key
+    user_email = setup_request.user_email
+    
+    auth = HTTPDigestAuth(public_key, private_key)
+    headers = {
+        "Accept": "application/vnd.atlas.2023-01-01+json",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # 1. Discover Organization
+        orgs_res = requests.get("https://cloud.mongodb.com/api/atlas/v2/orgs", auth=auth, headers=headers)
+        if orgs_res.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid MongoDB credentials or permission denied.")
+        
+        org_data = orgs_res.json()
+        if not org_data.get("results"):
+            raise HTTPException(status_code=404, detail="No MongoDB Organizations found for these keys.")
+        
+        org_id = org_data["results"][0]["id"]
+        
+        # 2. Create Project
+        project_name = f"Rapid-Agent-Suite-{uuid.uuid4().hex[:6]}"
+        project_payload = {"name": project_name}
+        project_res = requests.post("https://cloud.mongodb.com/api/atlas/v2/groups", 
+                                    auth=auth, headers=headers, json=project_payload)
+        
+        if project_res.status_code not in [200, 201]:
+            raise HTTPException(status_code=500, detail=f"Failed to create project: {project_res.text}")
+        
+        project_id = project_res.json()["id"]
+
+        # 3. Whitelist IPs (All for hackathon compatibility)
+        whitelist_payload = [{"ipAddress": "0.0.0.0/0", "comment": "Allow Cloud Run Agent Access"}]
+        requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{project_id}/accessList",
+                      auth=auth, headers=headers, json=whitelist_payload)
+
+        # 4. Create Database User
+        db_username = "agent_runtime_user"
+        db_password = generate_secure_password()
+        user_payload = {
+            "databaseName": "admin",
+            "password": db_password,
+            "roles": [{"databaseName": "smart_email_manager", "roleName": "readWrite"}],
+            "username": db_username
+        }
+        requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{project_id}/databaseUsers",
+                      auth=auth, headers=headers, json=user_payload)
+
+        # 5. Launch Free Tier Cluster (M0) on GCP
+        cluster_payload = {
+            "name": "email-agent-cluster",
+            "providerSettings": {
+                "providerName": "GCP",
+                "backingProviderName": "GCP",
+                "regionName": "US_EAST_1"
+            },
+            "clusterType": "REPLICASET"
+        }
+        cluster_res = requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{project_id}/clusters",
+                                    auth=auth, headers=headers, json=cluster_payload)
+
+        if cluster_res.status_code not in [200, 201, 202]:
+            raise HTTPException(status_code=500, detail=f"Failed to initiate cluster: {cluster_res.text}")
+
+        # 6. Store progress in memory/DB
+        user_db[user_email] = {
+            "status": "provisioning",
+            "project_id": project_id,
+            "project_name": project_name,
+            "db_user": db_username,
+            "db_pass": db_password
+        }
+        
+        return {
+            "status": "In-Progress", 
+            "message": f"Successfully initiated deployment for {project_name}. Cluster creation takes ~3-5 mins.",
+            "project_id": project_id
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # In-memory storage for demonstration. In production, use Redis or a DB.
 # Maps user_email -> { "connected": bool, "tokens": dict }
