@@ -53,10 +53,13 @@ async def setup_mongodb_backend(setup_request: MongoSetupRequest):
         
         org_id = org_data["results"][0]["id"]
         
-        # 2. Create Project (Linked to the discovered Organization)
+        # 2. Create Project (Standard V2 Pattern: orgId goes in the body)
         project_name = f"Rapid-Agent-Suite-{uuid.uuid4().hex[:6]}"
-        project_payload = {"name": project_name}
-        project_res = requests.post(f"https://cloud.mongodb.com/api/atlas/v2/orgs/{org_id}/groups", 
+        project_payload = {
+            "name": project_name,
+            "orgId": org_id
+        }
+        project_res = requests.post("https://cloud.mongodb.com/api/atlas/v2/groups", 
                                     auth=auth, headers=headers, json=project_payload)
         
         if project_res.status_code not in [200, 201]:
@@ -85,9 +88,10 @@ async def setup_mongodb_backend(setup_request: MongoSetupRequest):
         cluster_payload = {
             "name": "email-agent-cluster",
             "providerSettings": {
-                "providerName": "GCP",
+                "providerName": "TENANT",
                 "backingProviderName": "GCP",
-                "regionName": "US_EAST_1"
+                "instanceSizeName": "M0",
+                "regionName": "CENTRAL_US"
             },
             "clusterType": "REPLICASET"
         }
