@@ -120,16 +120,23 @@ def find_unclassified_by_semantic_group(query_embedding: list, limit: int = 5) -
 def get_last_sync_timestamp(user_email: str) -> str:
     """
     Retrieves the timestamp of the last synced email for a specific user.
+    Returns ISO string or 'None'.
     """
     try:
         collection = get_collection()
+        # Find the latest email for this user based on 'date' field
+        # Note: If date is stored as string, sorting might be off if not ISO.
+        # But we store as ISO in agent.py
         last_email = collection.find_one(
             {"user_email": user_email},
             sort=[("date", -1)]
         )
         
-        if last_email:
-            return last_email.get("date")
+        if last_email and last_email.get("date"):
+            date_val = last_email.get("date")
+            if isinstance(date_val, datetime):
+                return date_val.isoformat().replace("+00:00", "Z")
+            return str(date_val)
         return "None"
     except Exception as e:
         return f"Error fetching last sync: {str(e)}"
