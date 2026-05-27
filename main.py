@@ -115,7 +115,35 @@ def setup_agent_builder(project_id: str, location: str = "global"):
     enable_gcp_api(project_id, "dialogflow.googleapis.com")
 
     # 2. Create Data Store
-...
+    ds_client = discoveryengine.DataStoreServiceClient()
+    ds_id = f"email-ds-{uuid.uuid4().hex[:6]}"
+    
+    data_store = discoveryengine.DataStore(
+        display_name="Email Knowledge Base",
+        industry_vertical=discoveryengine.DataStore.IndustryVertical.GENERIC,
+        content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
+    )
+
+    parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
+    ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store, data_store_id=ds_id)
+    ds_operation.result()
+
+    # 3. Create Engine (The Agent App)
+    engine_client = discoveryengine.EngineServiceClient()
+    engine_id = f"email-agent-{uuid.uuid4().hex[:6]}"
+    
+    engine = discoveryengine.Engine(
+        display_name="Smart Email Manager",
+        solution_type=discoveryengine.Engine.SolutionType.CHAT,
+        data_store_ids=[ds_id],
+        chat_engine_config=discoveryengine.Engine.ChatEngineConfig(
+            agent_config=discoveryengine.Engine.ChatEngineConfig.AgentConfig(
+                language_code="en",
+                time_zone="UTC"
+            )
+        )
+    )
+
     engine_operation = engine_client.create_engine(parent=parent, engine=engine, engine_id=engine_id)
     engine_operation.result()
 
