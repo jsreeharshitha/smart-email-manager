@@ -16,6 +16,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.cloud import service_usage_v1
+from google.cloud import dialogflowcx_v3beta1 as dialogflow
 from mcp.server.fastmcp import FastMCP
 
 # --- 1. INITIALIZE FASTAPI & MCP ---
@@ -71,45 +72,62 @@ def enable_gcp_api(project_id: str, service_name: str):
     except Exception as e:
         print(f"API Enablement Warning: {str(e)}")
 
-def setup_agent_builder(project_id: str, location: str = "global"):
-    """Provisions Vertex AI Agent Builder Data Store and Engine."""
-    # 1. Enable API
-    enable_gcp_api(project_id, "discoveryengine.googleapis.com")
-
-    # 2. Create Data Store
-    ds_client = discoveryengine.DataStoreServiceClient()
-    ds_id = f"email-ds-{uuid.uuid4().hex[:6]}"
-    
-    data_store = discoveryengine.DataStore(
-        display_name="Email Knowledge Base",
-        industry_vertical=discoveryengine.DataStore.IndustryVertical.GENERIC,
-        content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
+def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global"):
+    """
+    Provisions a Playbook for the Generative AI Agent.
+    Defines the goals, instructions, and reasoning logic.
+    """
+    client = dialogflow.PlaybooksClient(
+        client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"}
     )
-
-    parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
-    ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store, data_store_id=ds_id)
-    ds_operation.result()
-
-    # 3. Create Engine (The Agent App)
-    engine_client = discoveryengine.EngineServiceClient()
-    engine_id = f"email-agent-{uuid.uuid4().hex[:6]}"
     
-    engine = discoveryengine.Engine(
-        display_name="Smart Email Manager",
-        solution_type=discoveryengine.Engine.SolutionType.CHAT,
-        data_store_ids=[ds_id],
-        chat_engine_config=discoveryengine.Engine.ChatEngineConfig(
-            agent_config=discoveryengine.Engine.ChatEngineConfig.AgentConfig(
-                language_code="en",
-                time_zone="UTC"
-            )
+    parent = f"projects/{project_id}/locations/{location}/agents/{agent_id}"
+    
+    playbook = dialogflow.Playbook(
+        display_name="Smart Email Management Playbook",
+        goal="Automatically organize, label, and summarize the user's Gmail inbox using semantic reasoning.",
+        instruction=dialogflow.Playbook.Instruction(
+            steps=[
+                dialogflow.Playbook.Step(text="Greet the user and explain your purpose as an AI Email Manager."),
+                dialogflow.Playbook.Step(text="Use the 'get_last_sync_timestamp' tool to check the status of the mailbox."),
+                dialogflow.Playbook.Step(text="If new emails are detected, use 'process_and_store_email' to index them into MongoDB."),
+                dialogflow.Playbook.Step(text="Analyze unclassified emails using 'find_unclassified_by_semantic_group' to identify patterns."),
+                dialogflow.Playbook.Step(text="If a strong semantic group is found (e.g., 'Travel', 'Work'), use 'create_label' to organize the inbox."),
+                dialogflow.Playbook.Step(text="Apply newly created labels to matching messages using 'apply_label_to_email'."),
+                dialogflow.Playbook.Step(text="Provide a summary of the organizational changes to the user.")
+            ]
         )
     )
 
+    request = dialogflow.CreatePlaybookRequest(
+        parent=parent,
+        playbook=playbook
+    )
+
+    response = client.create_playbook(request=request)
+    print(f"Created Playbook: {response.name}")
+    return response.name
+
+def setup_agent_builder(project_id: str, location: str = "global"):
+    """Provisions Vertex AI Agent Builder Data Store and Engine."""
+    # 1. Enable APIs
+    enable_gcp_api(project_id, "discoveryengine.googleapis.com")
+    enable_gcp_api(project_id, "dialogflow.googleapis.com")
+
+    # 2. Create Data Store
+...
     engine_operation = engine_client.create_engine(parent=parent, engine=engine, engine_id=engine_id)
     engine_operation.result()
 
-    return {"data_store_id": ds_id, "engine_id": engine_id}
+    # 4. Create the Playbook (The Instructions)
+    # Note: In Agent Builder, the engine_id acts as the agent_id
+    try:
+        playbook_name = setup_agent_playbook(project_id, engine_id, location)
+    except Exception as e:
+        print(f"Playbook Creation Error: {str(e)}")
+        playbook_name = "manual-setup-required"
+
+    return {"data_store_id": ds_id, "engine_id": engine_id, "playbook_name": playbook_name}
 
 @app.post("/api/setup-db")
 async def setup_infrastructure(setup_request: MongoSetupRequest):
