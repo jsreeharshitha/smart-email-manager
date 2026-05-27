@@ -21,10 +21,8 @@ from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import Response
 
 # --- 1. INITIALIZE FASTAPI ---
-# We use standard FastAPI to ensure all @app.post and @app.get decorators work correctly.
 app = FastAPI(title="Smart Email Manager API")
 
-# Registry of tools for the MCP-like interface
 TOOLS = {
     "setup_database": setup_database,
     "get_last_sync_timestamp": get_last_sync_timestamp,
@@ -42,7 +40,6 @@ TOOLS = {
 
 @app.get("/mcp")
 async def mcp_discovery():
-    """Exposes the list of available tools for the AI Agent."""
     return {
         "mcp_server": "SmartEmailManager",
         "status": "active",
@@ -51,23 +48,15 @@ async def mcp_discovery():
 
 @app.post("/mcp/call")
 async def call_mcp_tool(request: Request):
-    """
-    Standardized endpoint to call any agent tool.
-    Vertex AI Agent Builder can use this as a Webhook tool.
-    """
     try:
         body = await request.json()
         tool_name = body.get("tool")
         arguments = body.get("arguments", {})
-
         if tool_name not in TOOLS:
             raise HTTPException(status_code=404, detail=f"Tool {tool_name} not found.")
-
-        # Execute the tool function dynamically
         result = TOOLS[tool_name](**arguments)
         return {"status": "success", "result": result}
     except Exception as e:
-        print(f"Tool Execution Error ({tool_name}): {str(e)}")
         return {"status": "error", "message": str(e)}
 
 # --- 3. INFRASTRUCTURE PROVISIONING ---
@@ -83,21 +72,16 @@ def generate_secure_password(length=16):
     return ''.join(random.choice(characters) for i in range(length))
 
 def enable_gcp_api(project_id: str, service_name: str):
-    """Programmatically enables a GCP service."""
     try:
         client = service_usage_v1.ServiceUsageClient()
         operation = client.enable_service(name=f"projects/{project_id}/services/{service_name}")
         operation.result()
     except Exception as e:
-        print(f"API Enablement Warning for {service_name}: {str(e)}")
+        print(f"API Enablement Warning: {str(e)}")
 
 def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global"):
-    """Provisions a Playbook for the Generative AI Agent."""
-    client = dialogflow.PlaybooksClient(
-        client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"}
-    )
+    client = dialogflow.PlaybooksClient(client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"})
     parent = f"projects/{project_id}/locations/{location}/agents/{agent_id}"
-    
     playbook = dialogflow.Playbook(
         display_name="Smart Email Management Playbook",
         goal="Automatically organize, label, and summarize the user's Gmail inbox using semantic reasoning and autonomous category discovery.",
@@ -114,44 +98,46 @@ def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global
             ]
         )
     )
-
     request = dialogflow.CreatePlaybookRequest(parent=parent, playbook=playbook)
     response = client.create_playbook(request=request)
     return response.name
 
 def setup_agent_builder(project_id: str, location: str = "global"):
-    """Provisions Vertex AI Agent Builder Data Store and Engine."""
+    """Provisions Vertex AI Agent Builder Data Store and Engine using robust dict payloads."""
     enable_gcp_api(project_id, "discoveryengine.googleapis.com")
     enable_gcp_api(project_id, "dialogflow.googleapis.com")
 
+    # 1. Create Data Store
     ds_client = discoveryengine.DataStoreServiceClient()
     ds_id = f"email-ds-{uuid.uuid4().hex[:6]}"
     
-    # Corrected DataStore config
-    data_store = discoveryengine.DataStore(
-        display_name="Email Knowledge Base",
-        industry_vertical=discoveryengine.IndustryVertical.GENERIC,
-        content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
-    )
+    data_store_dict = {
+        "display_name": "Email Knowledge Base",
+        "industry_vertical": "GENERIC",
+        "content_config": "CONTENT_REQUIRED",
+    }
+    
     parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
-    ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store, data_store_id=ds_id)
+    ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store_dict, data_store_id=ds_id)
     ds_operation.result()
 
+    # 2. Create Engine (The Agent App)
     engine_client = discoveryengine.EngineServiceClient()
     engine_id = f"email-agent-{uuid.uuid4().hex[:6]}"
     
-    # Corrected Engine config: solution_type and chat_engine_config paths
-    engine = discoveryengine.Engine(
-        display_name="Smart Email Manager",
-        solution_type=discoveryengine.SolutionType.CHAT,
-        data_store_ids=[ds_id],
-        chat_engine_config=discoveryengine.Engine.ChatEngineConfig(
-            agent_config=discoveryengine.Engine.ChatEngineConfig.AgentConfig(
-                language_code="en", time_zone="UTC"
-            )
-        )
-    )
-    engine_operation = engine_client.create_engine(parent=parent, engine=engine, engine_id=engine_id)
+    engine_dict = {
+        "display_name": "Smart Email Manager",
+        "solution_type": "SOLUTION_TYPE_CHAT",
+        "data_store_ids": [ds_id],
+        "chat_engine_config": {
+            "agent_config": {
+                "language_code": "en",
+                "time_zone": "UTC"
+            }
+        }
+    }
+    
+    engine_operation = engine_client.create_engine(parent=parent, engine=engine_dict, engine_id=engine_id)
     engine_operation.result()
 
     try:
@@ -163,12 +149,10 @@ def setup_agent_builder(project_id: str, location: str = "global"):
     return {"data_store_id": ds_id, "engine_id": engine_id, "playbook_name": playbook_name}
 
 def setup_pubsub(project_id: str):
-    """Sets up Pub/Sub for Gmail Push Notifications."""
     publisher = pubsub_v1.PublisherClient()
     subscriber = pubsub_v1.SubscriberClient()
     topic_id = "gmail-notifications"
     topic_path = publisher.topic_path(project_id, topic_id)
-    
     try:
         publisher.create_topic(name=topic_path)
     except Exception:
@@ -185,7 +169,6 @@ def setup_pubsub(project_id: str):
     sub_id = "gmail-notifications-sub"
     sub_path = subscriber.subscription_path(project_id, sub_id)
     push_url = f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/api/on-new-mail"
-    
     try:
         subscriber.create_subscription(request={
             "name": sub_path, "topic": topic_path,
@@ -197,49 +180,39 @@ def setup_pubsub(project_id: str):
             "subscription": {"name": sub_path, "push_config": {"push_endpoint": push_url}},
             "update_mask": {"paths": ["push_config"]}
         })
-
     return topic_path
 
 @app.post("/api/setup-db")
 async def setup_infrastructure(setup_request: MongoSetupRequest):
-    """Orchestrates full Enterprise AI stack setup."""
     public_key = setup_request.mongo_public_key
     private_key = setup_request.mongo_private_key
     user_email = setup_request.user_email
     project_id = os.environ.get("PROJECT_ID", "grah-2026") 
-    
     auth = HTTPDigestAuth(public_key, private_key)
     headers = {"Accept": "application/vnd.atlas.2023-01-01+json", "Content-Type": "application/json"}
-
     try:
-        # 1. MongoDB Setup
         orgs_res = requests.get("https://cloud.mongodb.com/api/atlas/v2/orgs", auth=auth, headers=headers)
         org_id = orgs_res.json()["results"][0]["id"]
         project_name = f"Rapid-Agent-{uuid.uuid4().hex[:6]}"
         project_res = requests.post("https://cloud.mongodb.com/api/atlas/v2/groups", 
                                     auth=auth, headers=headers, json={"name": project_name, "orgId": org_id})
         mongo_project_id = project_res.json()["id"]
-
         requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{mongo_project_id}/accessList",
                       auth=auth, headers=headers, json=[{"ipAddress": "0.0.0.0/0"}])
-
         db_pass = generate_secure_password()
         requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{mongo_project_id}/databaseUsers",
                       auth=auth, headers=headers, json={
                           "databaseName": "admin", "password": db_pass, "username": "agent_user",
                           "roles": [{"databaseName": "smart_email_manager", "roleName": "readWrite"}]
                       })
-
         requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{mongo_project_id}/clusters",
                       auth=auth, headers=headers, json={
                           "name": "email-cluster", "clusterType": "REPLICASET",
                           "providerSettings": {"providerName": "TENANT", "backingProviderName": "GCP", 
                                               "instanceSizeName": "M0", "regionName": "CENTRAL_US"}
                       })
-
         agent_builder_info = setup_agent_builder(project_id)
         pubsub_topic = setup_pubsub(project_id)
-
         client = get_client()
         db = client["smart_email_manager"]
         db["UserSessions"].update_one(
@@ -255,24 +228,16 @@ async def setup_infrastructure(setup_request: MongoSetupRequest):
             },
             upsert=True
         )
-
         return {
-            "status": "In-Progress", 
-            "message": "Setup successful.",
-            "mongo_project_id": mongo_project_id,
-            "agent_builder_app": agent_builder_info["engine_id"],
-            "pubsub_topic": pubsub_topic,
-            "mcp_url": f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/mcp/call"
+            "status": "In-Progress", "message": "Setup successful.",
+            "mongo_project_id": mongo_project_id, "agent_builder_app": agent_builder_info["engine_id"],
+            "pubsub_topic": pubsub_topic, "mcp_url": f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/mcp/call"
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Setup failed: {str(e)}")
 
-# --- 4. EVENT HANDLER ---
-
 @app.post("/api/on-new-mail")
 async def handle_new_mail(request: Request):
-    """Receives push notifications from Gmail."""
     try:
         envelope = await request.json()
         import base64
@@ -281,20 +246,16 @@ async def handle_new_mail(request: Request):
         notification = json.loads(data_str)
         user_email = notification.get("emailAddress")
         new_history_id = notification.get("historyId")
-
         client = get_client()
         db = client["smart_email_manager"]
         user_session = db["UserSessions"].find_one({"user_email": user_email})
         if not user_session: return {"status": "ignored"}
-
         last_history_id = user_session.get("last_history_id")
         from tools.gmail_mcp import get_gmail_service
         gmail = get_gmail_service(user_email)
-
         if not last_history_id:
             db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
             return {"status": "initialized"}
-
         history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
         for change in history_res.get("history", []):
             for item in change.get("messagesAdded", []):
@@ -302,11 +263,9 @@ async def handle_new_mail(request: Request):
                 msg_detail = gmail.users().messages().get(userId="me", id=msg_id).execute()
                 metadata = {"subject": "New Mail", "message_id": msg_id, "user_email": user_email}
                 process_and_store_email(metadata, msg_detail.get("snippet", ""))
-
         db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
         return {"status": "success"}
     except Exception as e:
-        print(f"Handler Error: {str(e)}")
         return {"status": "error"}
 
 @app.get("/")
