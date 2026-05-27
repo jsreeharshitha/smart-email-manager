@@ -12,7 +12,7 @@ from tools.mongo_mcp import get_last_sync_timestamp, setup_database, find_unclas
 from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id
 from typing import List, Optional
 from pydantic import BaseModel
-from google.cloud import discoveryengine_v1 as discoveryengine
+from google.cloud import discoveryengine_v1beta as discoveryengine
 from google.cloud import service_usage_v1
 from google.cloud import dialogflowcx_v3beta1 as dialogflow
 from google.cloud import pubsub_v1
@@ -103,7 +103,7 @@ def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global
     return response.name
 
 def setup_agent_builder(project_id: str, location: str = "global"):
-    """Provisions Vertex AI Agent Builder Data Store and Engine using robust dict payloads."""
+    """Provisions Vertex AI Agent Builder Data Store and Engine using robust v1beta dict payloads."""
     enable_gcp_api(project_id, "discoveryengine.googleapis.com")
     enable_gcp_api(project_id, "dialogflow.googleapis.com")
 
@@ -132,9 +132,7 @@ def setup_agent_builder(project_id: str, location: str = "global"):
         "industry_vertical": "GENERIC",
         "chat_engine_config": {
             "agent_creation_config": {
-                "business_name": "Smart Email Manager Inc",
-                "default_agent_id": f"email-agent-{uuid.uuid4().hex[:6]}",
-                "location": location
+                "business_name": "Smart Email Manager",
             }
         }
     }
