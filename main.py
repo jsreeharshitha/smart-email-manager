@@ -128,7 +128,7 @@ def setup_agent_builder(project_id: str, location: str = "global"):
     ds_id = f"email-ds-{uuid.uuid4().hex[:6]}"
     data_store = discoveryengine.DataStore(
         display_name="Email Knowledge Base",
-        industry_vertical=discoveryengine.DataStore.IndustryVertical.GENERIC,
+        industry_vertical=discoveryengine.IndustryVertical.GENERIC,
         content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
     )
     parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
