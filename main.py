@@ -132,7 +132,7 @@ def setup_agent_builder(project_id: str, location: str = "global"):
         "industry_vertical": "GENERIC",
         "chat_engine_config": {
             "agent_creation_config": {
-                "business_name": "Smart Email Manager",
+                "business": "Smart Email Manager",
             }
         }
     }
