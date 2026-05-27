@@ -9,7 +9,7 @@ import string
 import random
 from db.mongo_client import get_client
 from config import settings
-from agent import process_and_store_email
+from toolbox import process_and_store_email
 from tools.mongo_mcp import get_last_sync_timestamp, setup_database, find_unclassified_by_semantic_group, store_email_record
 from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id
 from typing import List, Optional
