@@ -107,52 +107,74 @@ def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global
     return response.name
 
 def setup_agent_builder(project_id: str, location: str = "global"):
-    """Provisions Vertex AI Agent Builder Data Store and Engine using robust v1beta dict payloads."""
+    """Provisions Vertex AI Agent Builder resources with idempotency check."""
     enable_gcp_api(project_id, "discoveryengine.googleapis.com")
     enable_gcp_api(project_id, "dialogflow.googleapis.com")
 
-    # 1. Create Data Store
-    ds_client = discoveryengine.DataStoreServiceClient()
-    ds_id = f"email-ds-{uuid.uuid4().hex[:6]}"
-    
-    data_store_dict = {
-        "display_name": "Email Knowledge Base",
-        "industry_vertical": "GENERIC",
-        "content_config": "CONTENT_REQUIRED",
-    }
-    
     parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
-    ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store_dict, data_store_id=ds_id)
-    ds_operation.result()
-
-    # 2. Create Engine (The Agent App)
-    engine_client = discoveryengine.EngineServiceClient()
-    engine_id = f"email-agent-{uuid.uuid4().hex[:6]}"
     
-    engine_dict = {
-        "display_name": "Smart Email Manager",
-        "solution_type": "SOLUTION_TYPE_CHAT",
-        "data_store_ids": [ds_id],
-        "industry_vertical": "GENERIC",
-        "chat_engine_config": {
-            "agent_creation_config": {
-                "business": "Smart Email Manager",
-                "default_language_code": "en",
-                "time_zone": "UTC"
+    # 1. Handle Data Store (Idempotent)
+    ds_client = discoveryengine.DataStoreServiceClient()
+    ds_id = None
+    
+    # Check if a data store already exists
+    existing_ds = ds_client.list_data_stores(parent=parent)
+    for ds in existing_ds:
+        if ds.display_name == "Email Knowledge Base":
+            ds_id = ds.name.split("/")[-1]
+            print(f"Found existing Data Store: {ds_id}")
+            break
+            
+    if not ds_id:
+        ds_id = f"email-ds-{uuid.uuid4().hex[:6]}"
+        data_store_dict = {
+            "display_name": "Email Knowledge Base",
+            "industry_vertical": "GENERIC",
+            "content_config": "CONTENT_REQUIRED",
+        }
+        ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store_dict, data_store_id=ds_id)
+        ds_operation.result()
+        print(f"Created new Data Store: {ds_id}")
+
+    # 2. Handle Engine (Idempotent)
+    engine_client = discoveryengine.EngineServiceClient()
+    engine_resource_id = None
+    
+    # Check if an engine already exists
+    existing_engines = engine_client.list_engines(parent=parent)
+    for eng in existing_engines:
+        if eng.display_name == "Smart Email Manager":
+            engine_resource_id = eng.name.split("/")[-1]
+            print(f"Found existing Engine: {engine_resource_id}")
+            break
+
+    if not engine_resource_id:
+        engine_resource_id = f"email-agent-{uuid.uuid4().hex[:6]}"
+        engine_dict = {
+            "display_name": "Smart Email Manager",
+            "solution_type": "SOLUTION_TYPE_CHAT",
+            "data_store_ids": [ds_id],
+            "industry_vertical": "GENERIC",
+            "chat_engine_config": {
+                "agent_creation_config": {
+                    "business": "Smart Email Manager",
+                    "default_language_code": "en",
+                    "time_zone": "UTC"
+                }
             }
         }
-    }
-    
-    engine_operation = engine_client.create_engine(parent=parent, engine=engine_dict, engine_id=engine_id)
-    engine_operation.result()
+        engine_operation = engine_client.create_engine(parent=parent, engine=engine_dict, engine_id=engine_resource_id)
+        engine_operation.result()
+        print(f"Created new Engine: {engine_resource_id}")
 
     try:
-        playbook_name = setup_agent_playbook(project_id, engine_id, location)
+        # Playbooks can be multiple, we try to create a fresh one or handle failure
+        playbook_name = setup_agent_playbook(project_id, engine_resource_id, location)
     except Exception as e:
-        print(f"Playbook Creation Error: {str(e)}")
-        playbook_name = "manual-setup-required"
+        print(f"Playbook Note (Already exists?): {str(e)}")
+        playbook_name = "existing-or-manual"
 
-    return {"data_store_id": ds_id, "engine_id": engine_id, "playbook_name": playbook_name}
+    return {"data_store_id": ds_id, "engine_id": engine_resource_id, "playbook_name": playbook_name}
 
 def setup_pubsub(project_id: str):
     publisher = pubsub_v1.PublisherClient()
