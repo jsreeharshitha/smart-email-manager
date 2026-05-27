@@ -5,7 +5,7 @@ import json
 import uuid
 import string
 import random
-from db.mongo_client import get_client
+from db.mongo_client import get_client, get_collection
 from config import settings
 from toolbox import process_and_store_email, cluster_unclassified_emails
 from tools.mongo_mcp import get_last_sync_timestamp, setup_database, find_unclassified_by_semantic_group, store_email_record
@@ -16,28 +16,61 @@ from google.cloud import discoveryengine_v1 as discoveryengine
 from google.cloud import service_usage_v1
 from google.cloud import dialogflowcx_v3beta1 as dialogflow
 from google.cloud import pubsub_v1
-from mcp.server.fastmcp import FastMCP
 from datetime import datetime, UTC
-from fastapi import Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException
+from starlette.responses import Response
 
-# --- 1. INITIALIZE MCP SERVER ---
-# FastMCP acts as our primary ASGI application
-app = FastMCP("SmartEmailManager")
+# --- 1. INITIALIZE FASTAPI ---
+# We use standard FastAPI to ensure all @app.post and @app.get decorators work correctly.
+app = FastAPI(title="Smart Email Manager API")
 
-# Register all tools with the MCP Server
-# These are the "Superpowers" Gemini will use via Agent Builder
-app.tool()(setup_database)
-app.tool()(get_last_sync_timestamp)
-app.tool()(find_unclassified_by_semantic_group)
-app.tool()(store_email_record)
-app.tool()(process_and_store_email)
-app.tool()(cluster_unclassified_emails)
-app.tool()(create_label)
-app.tool()(get_labels)
-app.tool()(apply_label_to_email)
-app.tool()(get_emails_by_id)
+# Registry of tools for the MCP-like interface
+TOOLS = {
+    "setup_database": setup_database,
+    "get_last_sync_timestamp": get_last_sync_timestamp,
+    "find_unclassified_by_semantic_group": find_unclassified_by_semantic_group,
+    "store_email_record": store_email_record,
+    "process_and_store_email": process_and_store_email,
+    "cluster_unclassified_emails": cluster_unclassified_emails,
+    "create_label": create_label,
+    "get_labels": get_labels,
+    "apply_label_to_email": apply_label_to_email,
+    "get_emails_by_id": get_emails_by_id
+}
 
-# --- 2. INFRASTRUCTURE PROVISIONING ---
+# --- 2. MCP INTERFACE ENDPOINTS ---
+
+@app.get("/mcp")
+async def mcp_discovery():
+    """Exposes the list of available tools for the AI Agent."""
+    return {
+        "mcp_server": "SmartEmailManager",
+        "status": "active",
+        "available_tools": list(TOOLS.keys())
+    }
+
+@app.post("/mcp/call")
+async def call_mcp_tool(request: Request):
+    """
+    Standardized endpoint to call any agent tool.
+    Vertex AI Agent Builder can use this as a Webhook tool.
+    """
+    try:
+        body = await request.json()
+        tool_name = body.get("tool")
+        arguments = body.get("arguments", {})
+
+        if tool_name not in TOOLS:
+            raise HTTPException(status_code=404, detail=f"Tool {tool_name} not found.")
+
+        # Execute the tool function dynamically
+        result = TOOLS[tool_name](**arguments)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        print(f"Tool Execution Error ({tool_name}): {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+# --- 3. INFRASTRUCTURE PROVISIONING ---
 
 class MongoSetupRequest(BaseModel):
     mongo_public_key: str
@@ -50,14 +83,13 @@ def generate_secure_password(length=16):
     return ''.join(random.choice(characters) for i in range(length))
 
 def enable_gcp_api(project_id: str, service_name: str):
-    """Programmatically enables a GCP service in the target project."""
+    """Programmatically enables a GCP service."""
     try:
         client = service_usage_v1.ServiceUsageClient()
         operation = client.enable_service(name=f"projects/{project_id}/services/{service_name}")
-        print(f"Enabling API {service_name} for {project_id}...")
         operation.result()
     except Exception as e:
-        print(f"API Enablement Warning: {str(e)}")
+        print(f"API Enablement Warning for {service_name}: {str(e)}")
 
 def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global"):
     """Provisions a Playbook for the Generative AI Agent."""
@@ -92,7 +124,6 @@ def setup_agent_builder(project_id: str, location: str = "global"):
     enable_gcp_api(project_id, "discoveryengine.googleapis.com")
     enable_gcp_api(project_id, "dialogflow.googleapis.com")
 
-    # Data Store
     ds_client = discoveryengine.DataStoreServiceClient()
     ds_id = f"email-ds-{uuid.uuid4().hex[:6]}"
     data_store = discoveryengine.DataStore(
@@ -104,7 +135,6 @@ def setup_agent_builder(project_id: str, location: str = "global"):
     ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store, data_store_id=ds_id)
     ds_operation.result()
 
-    # Engine
     engine_client = discoveryengine.EngineServiceClient()
     engine_id = f"email-agent-{uuid.uuid4().hex[:6]}"
     engine = discoveryengine.Engine(
@@ -132,16 +162,14 @@ def setup_pubsub(project_id: str):
     """Sets up Pub/Sub for Gmail Push Notifications."""
     publisher = pubsub_v1.PublisherClient()
     subscriber = pubsub_v1.SubscriberClient()
-    
     topic_id = "gmail-notifications"
     topic_path = publisher.topic_path(project_id, topic_id)
     
     try:
         publisher.create_topic(name=topic_path)
     except Exception:
-        pass # Already exists
+        pass
 
-    # Grant Gmail Permission
     policy = publisher.get_iam_policy(request={"resource": topic_path})
     gmail_sa = "serviceAccount:gmail-api-push@system.gserviceaccount.com"
     if not any(gmail_sa in b.members for b in policy.bindings if b.role == "roles/pubsub.publisher"):
@@ -150,7 +178,6 @@ def setup_pubsub(project_id: str):
             "policy": {"bindings": [{"role": "roles/pubsub.publisher", "members": [gmail_sa]}]}
         })
 
-    # Push Subscription
     sub_id = "gmail-notifications-sub"
     sub_path = subscriber.subscription_path(project_id, sub_id)
     push_url = f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/api/on-new-mail"
@@ -169,7 +196,6 @@ def setup_pubsub(project_id: str):
 
     return topic_path
 
-# Standard web routes added directly to the FastMCP app
 @app.post("/api/setup-db")
 async def setup_infrastructure(setup_request: MongoSetupRequest):
     """Orchestrates full Enterprise AI stack setup."""
@@ -207,13 +233,9 @@ async def setup_infrastructure(setup_request: MongoSetupRequest):
                                               "instanceSizeName": "M0", "regionName": "CENTRAL_US"}
                       })
 
-        # 2. Agent Builder Setup
         agent_builder_info = setup_agent_builder(project_id)
-
-        # 3. Pub/Sub Setup
         pubsub_topic = setup_pubsub(project_id)
 
-        # 4. Persist Credentials to MongoDB
         client = get_client()
         db = client["smart_email_manager"]
         db["UserSessions"].update_one(
@@ -223,9 +245,7 @@ async def setup_infrastructure(setup_request: MongoSetupRequest):
                     "status": "ready",
                     "mongo_project_id": mongo_project_id,
                     "agent_builder": agent_builder_info,
-                    "credentials": {
-                        "access_token": setup_request.gmail_token,
-                    },
+                    "credentials": {"access_token": setup_request.gmail_token},
                     "updated_at": datetime.now(UTC).isoformat()
                 }
             },
@@ -234,110 +254,62 @@ async def setup_infrastructure(setup_request: MongoSetupRequest):
 
         return {
             "status": "In-Progress", 
-            "message": f"Successfully initiated Enterprise AI Stack setup.",
+            "message": "Setup successful.",
             "mongo_project_id": mongo_project_id,
             "agent_builder_app": agent_builder_info["engine_id"],
             "pubsub_topic": pubsub_topic,
-            "mcp_url": f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/mcp/sse"
+            "mcp_url": f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/mcp/call"
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Setup failed: {str(e)}")
 
+# --- 4. EVENT HANDLER ---
+
 @app.post("/api/on-new-mail")
 async def handle_new_mail(request: Request):
-    """Receives push notifications from Gmail via Pub/Sub."""
-    envelope = await request.json()
-    if not envelope:
-        return {"status": "error", "message": "Missing envelope"}
-    
-    import base64
-    pubsub_message = envelope.get("message", {})
-    data_str = base64.b64decode(pubsub_message.get("data", "")).decode("utf-8")
-    notification = json.loads(data_str)
-    
-    user_email = notification.get("emailAddress")
-    new_history_id = notification.get("historyId")
-    
-    print(f"Notification received for {user_email}. New History ID: {new_history_id}")
+    """Receives push notifications from Gmail."""
+    try:
+        envelope = await request.json()
+        import base64
+        pubsub_message = envelope.get("message", {})
+        data_str = base64.b64decode(pubsub_message.get("data", "")).decode("utf-8")
+        notification = json.loads(data_str)
+        user_email = notification.get("emailAddress")
+        new_history_id = notification.get("historyId")
 
-    client = get_client()
-    db = client["smart_email_manager"]
-    user_session = db["UserSessions"].find_one({"user_email": user_email})
+        client = get_client()
+        db = client["smart_email_manager"]
+        user_session = db["UserSessions"].find_one({"user_email": user_email})
+        if not user_session: return {"status": "ignored"}
 
-    if not user_session:
-        return {"status": "ignored", "message": "User session not found"}
+        last_history_id = user_session.get("last_history_id")
+        from tools.gmail_mcp import get_gmail_service
+        gmail = get_gmail_service(user_email)
 
-    last_history_id = user_session.get("last_history_id")
-    
-    from tools.gmail_mcp import get_gmail_service
-    gmail = get_gmail_service(user_email)
+        if not last_history_id:
+            db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
+            return {"status": "initialized"}
 
-    if not last_history_id:
-        db["UserSessions"].update_one(
-            {"user_email": user_email},
-            {"$set": {"last_history_id": new_history_id}}
-        )
-        return {"status": "initialized", "history_id": new_history_id}
+        history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
+        for change in history_res.get("history", []):
+            for item in change.get("messagesAdded", []):
+                msg_id = item.get("message", {}).get("id")
+                msg_detail = gmail.users().messages().get(userId="me", id=msg_id).execute()
+                metadata = {"subject": "New Mail", "message_id": msg_id, "user_email": user_email}
+                process_and_store_email(metadata, msg_detail.get("snippet", ""))
 
-    history_res = gmail.users().history().list(
-        userId="me",
-        startHistoryId=last_history_id,
-        historyTypes=["messageAdded"]
-    ).execute()
-
-    changes = history_res.get("history", [])
-    new_messages_count = 0
-
-    for change in changes:
-        messages_added = change.get("messagesAdded", [])
-        for item in messages_added:
-            msg_id = item.get("message", {}).get("id")
-            if not msg_id:
-                continue
-
-            msg_detail = gmail.users().messages().get(userId="me", id=msg_id).execute()
-            headers = msg_detail.get("payload", {}).get("headers", [])
-            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "No Subject")
-            sender = next((h["value"] for h in headers if h["name"] == "From"), "Unknown")
-            date = next((h["value"] for h in headers if h["name"] == "Date"), "")
-            
-            metadata = {
-                "subject": subject,
-                "sender": sender,
-                "date": date,
-                "message_id": msg_id,
-                "user_email": user_email
-            }
-            body = msg_detail.get("snippet", "")
-            
-            process_and_store_email(metadata, body)
-            new_messages_count += 1
-            print(f"Indexed new email: {subject} (ID: {msg_id})")
-
-    db["UserSessions"].update_one(
-        {"user_email": user_email},
-        {"$set": {"last_history_id": new_history_id}}
-    )
-
-    return {
-        "status": "success",
-        "processed": new_messages_count,
-        "history_id": new_history_id
-    }
+        db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Handler Error: {str(e)}")
+        return {"status": "error"}
 
 @app.get("/")
 async def root():
-    return {
-        "message": "Smart Email Manager Agent is running.",
-        "mcp_status": "active",
-        "mcp_endpoint": "/mcp/sse"
-    }
+    return {"message": "Smart Email Manager Agent is running.", "status": "active"}
 
 if __name__ == "__main__":
-    # Use the FastMCP run method which handles the server
-    # Or use uvicorn on the app object directly
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    # Note: FastMCP is an ASGI app, so we run it directly
     uvicorn.run(app, host="0.0.0.0", port=port)
