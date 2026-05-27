@@ -129,10 +129,12 @@ def setup_agent_builder(project_id: str, location: str = "global"):
         "display_name": "Smart Email Manager",
         "solution_type": "SOLUTION_TYPE_CHAT",
         "data_store_ids": [ds_id],
+        "industry_vertical": "GENERIC",
         "chat_engine_config": {
-            "agent_config": {
-                "language_code": "en",
-                "time_zone": "UTC"
+            "agent_creation_config": {
+                "business_name": "Smart Email Manager Inc",
+                "default_agent_id": f"email-agent-{uuid.uuid4().hex[:6]}",
+                "location": location
             }
         }
     }
