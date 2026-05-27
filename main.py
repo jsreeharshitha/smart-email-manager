@@ -5,6 +5,7 @@ import json
 import uuid
 import string
 import random
+import traceback
 from db.mongo_client import get_client, get_collection
 from config import settings
 from toolbox import process_and_store_email, cluster_unclassified_emails
@@ -57,6 +58,7 @@ async def call_mcp_tool(request: Request):
         result = TOOLS[tool_name](**arguments)
         return {"status": "success", "result": result}
     except Exception as e:
+        print(f"Tool Execution Error ({tool_name}): {str(e)}")
         return {"status": "error", "message": str(e)}
 
 # --- 3. INFRASTRUCTURE PROVISIONING ---
@@ -72,12 +74,14 @@ def generate_secure_password(length=16):
     return ''.join(random.choice(characters) for i in range(length))
 
 def enable_gcp_api(project_id: str, service_name: str):
+    """Programmatically enables a GCP service."""
     try:
         client = service_usage_v1.ServiceUsageClient()
-        operation = client.enable_service(name=f"projects/{project_id}/services/{service_name}")
+        # Corrected: Pass the name argument positionally as expected by the client
+        operation = client.enable_service(request={"name": f"projects/{project_id}/services/{service_name}"})
         operation.result()
     except Exception as e:
-        print(f"API Enablement Warning: {str(e)}")
+        print(f"API Enablement Warning for {service_name}: {str(e)}")
 
 def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global"):
     client = dialogflow.PlaybooksClient(client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"})
@@ -236,6 +240,8 @@ async def setup_infrastructure(setup_request: MongoSetupRequest):
             "pubsub_topic": pubsub_topic, "mcp_url": f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/mcp/call"
         }
     except Exception as e:
+        print(f"CRITICAL SETUP ERROR: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Setup failed: {str(e)}")
 
 @app.post("/api/on-new-mail")
