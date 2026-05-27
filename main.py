@@ -239,67 +239,86 @@ def setup_pubsub(project_id: str):
         })
     return topic_path
 
-@app.post("/api/setup-db")
-async def setup_infrastructure(setup_request: MongoSetupRequest):
+@app.post("/api/setup-db-init")
+async def setup_db_init(setup_request: MongoSetupRequest):
+    """Phase 1: Just trigger MongoDB Atlas provisioning and exit fast."""
     public_key = setup_request.mongo_public_key
     private_key = setup_request.mongo_private_key
     user_email = setup_request.user_email
-    project_id = os.environ.get("PROJECT_ID", "grah-2026") 
+    
     auth = HTTPDigestAuth(public_key, private_key)
     headers = {"Accept": "application/vnd.atlas.2023-01-01+json", "Content-Type": "application/json"}
+    
     try:
+        # Quick Atlas API Calls (Takes 1-2 seconds total)
         orgs_res = requests.get("https://cloud.mongodb.com/api/atlas/v2/orgs", auth=auth, headers=headers)
         org_id = orgs_res.json()["results"][0]["id"]
+        
         project_name = f"Rapid-Agent-{uuid.uuid4().hex[:6]}"
         project_res = requests.post("https://cloud.mongodb.com/api/atlas/v2/groups", 
                                     auth=auth, headers=headers, json={"name": project_name, "orgId": org_id})
         mongo_project_id = project_res.json()["id"]
+        
+        # Configure access and user
         requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{mongo_project_id}/accessList",
                       auth=auth, headers=headers, json=[{"ipAddress": "0.0.0.0/0"}])
+        
         db_pass = generate_secure_password()
         requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{mongo_project_id}/databaseUsers",
                       auth=auth, headers=headers, json={
                           "databaseName": "admin", "password": db_pass, "username": "agent_user",
                           "roles": [{"databaseName": "smart_email_manager", "roleName": "readWrite"}]
                       })
+
+        # Trigger Cluster Build
         requests.post(f"https://cloud.mongodb.com/api/atlas/v2/groups/{mongo_project_id}/clusters",
                       auth=auth, headers=headers, json={
                           "name": "email-cluster", "clusterType": "REPLICASET",
                           "providerSettings": {"providerName": "TENANT", "backingProviderName": "GCP", 
-                                              "instanceSizeName": "M0", "regionName": "CENTRAL_US"}
+                                                "instanceSizeName": "M0", "regionName": "CENTRAL_US"}
                       })
+        
+        return {
+            "status": "db_provisioning",
+            "mongo_project_id": mongo_project_id,
+            "message": "Database cluster instantiation triggered."
+        }
+    except Exception as e:
+        print(f"INIT SETUP ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/setup-gcp-infra")
+async def setup_gcp_infra(project_id: str, mongo_project_id: str, user_email: str, gmail_token: str):
+    """Phase 2: Provision Vertex AI / Agent Builder and Pub/Sub in its own window."""
+    try:
         agent_builder_info = setup_agent_builder(project_id)
         pubsub_topic = setup_pubsub(project_id)
         
-        # Note: Writing to DB might fail if cluster is still provisioning or MONGO_URI is not set
+        # Safe structural session payload caching (Database might still be provisioning)
         try:
             client = get_client()
             db = client["smart_email_manager"]
             db["UserSessions"].update_one(
                 {"user_email": user_email},
-                {
-                    "$set": {
-                        "status": "ready",
-                        "mongo_project_id": mongo_project_id,
-                        "agent_builder": agent_builder_info,
-                        "credentials": {"access_token": setup_request.gmail_token},
-                        "updated_at": datetime.now(UTC).isoformat()
-                    }
-                },
-                upsert=True
+                {"$set": {
+                    "mongo_project_id": mongo_project_id,
+                    "agent_builder": agent_builder_info,
+                    "credentials": {"access_token": gmail_token},
+                    "updated_at": datetime.now(UTC).isoformat()
+                }}, upsert=True
             )
-        except Exception as db_e:
-            print(f"Database Session Note (Cluster still provisioning?): {str(db_e)}")
+        except Exception:
+            pass # Suppress if cluster isn't ready to receive it yet
             
         return {
-            "status": "In-Progress", "message": "Setup successful. Note: MongoDB cluster is provisioning in the background and may take a few minutes to be ready.",
-            "mongo_project_id": mongo_project_id, "agent_builder_app": agent_builder_info["engine_id"],
-            "pubsub_topic": pubsub_topic, "mcp_url": f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/mcp/call"
+            "status": "gcp_ready",
+            "agent_builder_app": agent_builder_info["engine_id"],
+            "pubsub_topic": pubsub_topic,
+            "message": "Vertex AI Environment and Pub/Sub provisioned successfully."
         }
     except Exception as e:
-        print(f"CRITICAL SETUP ERROR: {str(e)}")
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Setup failed: {str(e)}")
+        print(f"GCP INFRA ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/on-new-mail")
 async def handle_new_mail(request: Request):
