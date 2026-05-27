@@ -270,23 +270,29 @@ async def setup_infrastructure(setup_request: MongoSetupRequest):
                       })
         agent_builder_info = setup_agent_builder(project_id)
         pubsub_topic = setup_pubsub(project_id)
-        client = get_client()
-        db = client["smart_email_manager"]
-        db["UserSessions"].update_one(
-            {"user_email": user_email},
-            {
-                "$set": {
-                    "status": "ready",
-                    "mongo_project_id": mongo_project_id,
-                    "agent_builder": agent_builder_info,
-                    "credentials": {"access_token": setup_request.gmail_token},
-                    "updated_at": datetime.now(UTC).isoformat()
-                }
-            },
-            upsert=True
-        )
+        
+        # Note: Writing to DB might fail if cluster is still provisioning or MONGO_URI is not set
+        try:
+            client = get_client()
+            db = client["smart_email_manager"]
+            db["UserSessions"].update_one(
+                {"user_email": user_email},
+                {
+                    "$set": {
+                        "status": "ready",
+                        "mongo_project_id": mongo_project_id,
+                        "agent_builder": agent_builder_info,
+                        "credentials": {"access_token": setup_request.gmail_token},
+                        "updated_at": datetime.now(UTC).isoformat()
+                    }
+                },
+                upsert=True
+            )
+        except Exception as db_e:
+            print(f"Database Session Note (Cluster still provisioning?): {str(db_e)}")
+            
         return {
-            "status": "In-Progress", "message": "Setup successful.",
+            "status": "In-Progress", "message": "Setup successful. Note: MongoDB cluster is provisioning in the background and may take a few minutes to be ready.",
             "mongo_project_id": mongo_project_id, "agent_builder_app": agent_builder_info["engine_id"],
             "pubsub_topic": pubsub_topic, "mcp_url": f"{os.environ.get('CLOUD_RUN_URL', 'https://agent.run.app')}/mcp/call"
         }
@@ -326,6 +332,16 @@ async def handle_new_mail(request: Request):
         return {"status": "success"}
     except Exception as e:
         return {"status": "error"}
+
+@app.get("/api/verify-db")
+async def verify_database():
+    try:
+        client = get_client()
+        # Admin command 'ping' is the standard way to check connectivity
+        client.admin.command('ping')
+        return {"status": "ready", "message": "Database is active and reachable."}
+    except Exception as e:
+        return {"status": "provisioning", "message": f"Database is not yet ready: {str(e)}"}
 
 @app.get("/")
 async def root():
