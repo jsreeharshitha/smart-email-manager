@@ -1,51 +1,71 @@
 import os.path
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from mcp.server.fastmcp import FastMCP
+from db.mongo_client import get_client
+from config import settings
 
 # Initialize FastMCP for the Gmail Suite
 mcp = FastMCP("GmailSuite")
 
-# Required Scopes for managing labels and modifying messages
+# Required Scopes
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.labels',
-    'https://www.googleapis.com/auth/gmail.modify'
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/gmail.readonly'
 ]
 
-def get_gmail_service():
-    """Authenticates and returns the Gmail API service instance."""
-    creds = None
-    # token.json stores the user's access and refresh tokens
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # Requires credentials.json from Google Cloud Console
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-
-    return build('gmail', 'v1', credentials=creds)
-
-@mcp.tool()
-def create_label(label_name: str) -> str:
+def get_gmail_service(user_email: str):
     """
-    Creates a new custom label in Gmail.
-    
-    Args:
-        label_name: The name of the label to create (e.g., 'Project Alpha').
+    Authenticates and returns the Gmail API service instance for a specific user.
+    Retrieves credentials from MongoDB UserSessions.
     """
     try:
-        service = get_gmail_service()
+        client = get_client()
+        db = client[settings.DB_NAME]
+        user_session = db["UserSessions"].find_one({"user_email": user_email})
+
+        if not user_session or "credentials" not in user_session:
+            # Fallback for local testing if credentials.json exists (optional, remove for pure production)
+            if os.path.exists('token.json'):
+                 creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+                 return build('gmail', 'v1', credentials=creds)
+            raise Exception(f"No Gmail credentials found for user: {user_email}.")
+
+        creds_data = user_session["credentials"]
+        creds = Credentials(
+            token=creds_data.get('access_token'),
+            refresh_token=creds_data.get('refresh_token'),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=os.environ.get("GMAIL_CLIENT_ID"),
+            client_secret=os.environ.get("GMAIL_CLIENT_SECRET"),
+            scopes=SCOPES
+        )
+
+        # Refresh if expired
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Save the updated token back to MongoDB
+            db["UserSessions"].update_one(
+                {"user_email": user_email},
+                {"$set": {"credentials.access_token": creds.token, "updated_at": "auto-refreshed"}}
+            )
+
+        return build('gmail', 'v1', credentials=creds)
+
+    except Exception as e:
+        print(f"Gmail Auth Error for {user_email}: {str(e)}")
+        raise e
+
+@mcp.tool()
+def create_label(user_email: str, label_name: str) -> str:
+    """
+    Creates a new custom label in Gmail.
+    """
+    try:
+        service = get_gmail_service(user_email)
         
         label_object = {
             'name': label_name,
@@ -61,20 +81,19 @@ def create_label(label_name: str) -> str:
         return f"Successfully created label: {created_label['name']} (ID: {created_label['id']})"
 
     except HttpError as error:
-        # Specific handling for 409 Conflict (Label already exists)
         if error.resp.status == 409:
-            return f"Error: The label '{label_name}' already exists in this Gmail account."
+            return f"Error: The label '{label_name}' already exists."
         return f"An error occurred: {error}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 @mcp.tool()
-def get_labels() -> str:
+def get_labels(user_email: str) -> str:
     """
     Retrieves all labels in the user's Gmail account.
     """
     try:
-        service = get_gmail_service()
+        service = get_gmail_service(user_email)
         results = service.users().labels().list(userId='me').execute()
         labels = results.get('labels', [])
 
@@ -86,24 +105,17 @@ def get_labels() -> str:
             output += f"- {label['name']} (ID: {label['id']})\n"
         return output
 
-    except HttpError as error:
-        return f"An error occurred: {error}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 @mcp.tool()
-def apply_label_to_email(message_id: str, label_name: str) -> str:
+def apply_label_to_email(user_email: str, message_id: str, label_name: str) -> str:
     """
-    Applies a label to a specific email message using the label's name.
-    
-    Args:
-        message_id: The ID of the email message to label.
-        label_name: The name of the label to apply.
+    Applies a label to a specific email message.
     """
     try:
-        service = get_gmail_service()
+        service = get_gmail_service(user_email)
         
-        # 1. Find the label ID by name
         results = service.users().labels().list(userId='me').execute()
         labels = results.get('labels', [])
         
@@ -114,9 +126,8 @@ def apply_label_to_email(message_id: str, label_name: str) -> str:
                 break
         
         if not label_id:
-            return f"Error: Label '{label_name}' not found. Please create it first using create_label."
+            return f"Error: Label '{label_name}' not found."
             
-        # 2. Apply the label to the message
         service.users().messages().modify(
             userId='me',
             id=message_id,
@@ -125,24 +136,16 @@ def apply_label_to_email(message_id: str, label_name: str) -> str:
         
         return f"Successfully applied label '{label_name}' to message {message_id}"
 
-    except HttpError as error:
-        return f"An error occurred: {error}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 @mcp.tool()
-def get_emails_by_id(email_id: str = "rahulgputcha.dev@gmail.com") -> str:
+def get_emails_by_id(user_email: str, email_id: str) -> str:
     """
-    Retrieves all email messages associated with a specific email address.
-
-    Args:
-        email_id: The email address to search for (sender or recipient).
+    Retrieves email messages for a specific user.
     """
     try:
-        service = get_gmail_service()
-
-        # Search for messages matching the email_id
-        # 'q' parameter uses standard Gmail search syntax
+        service = get_gmail_service(user_email)
         query = email_id
         results = service.users().messages().list(userId='me', q=query, maxResults=10).execute()
         messages = results.get('messages', [])
@@ -150,42 +153,16 @@ def get_emails_by_id(email_id: str = "rahulgputcha.dev@gmail.com") -> str:
         if not messages:
             return f"No emails found for: {email_id}"
 
-        output = f"Emails found for {email_id} (showing top {len(messages)}):\n"
-
+        output = f"Emails found for {email_id}:\n"
         for msg in messages:
-            # Get detailed message content
             msg_detail = service.users().messages().get(userId='me', id=msg['id']).execute()
-
-            # Extract headers for Subject and Date
             headers = msg_detail.get('payload', {}).get('headers', [])
-            subject = "No Subject"
-            date = "Unknown Date"
-            for header in headers:
-                if header['name'] == 'Subject':
-                    subject = header['value']
-                if header['name'] == 'Date':
-                    date = header['value']
-
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "No Subject")
+            date = next((h['value'] for h in headers if h['name'] == 'Date'), "Unknown Date")
             snippet = msg_detail.get('snippet', '')
-            output += f"\n--- ID: {msg['id']} ---\n"
-            output += f"Date: {date}\n"
-            output += f"Subject: {subject}\n"
-            output += f"Snippet: {snippet}\n"
+            output += f"\nID: {msg['id']}\nDate: {date}\nSubject: {subject}\nSnippet: {snippet}\n"
 
         return output
 
-    except HttpError as error:
-        return f"An error occurred: {error}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
-
-@mcp.tool()
-def read_emails():
-
-    """Placeholder for reading emails from Gmail."""
-    return "Read emails functionality not yet implemented."
-
-@mcp.tool()
-def send_email(to: str, subject: str, body: str):
-    """Placeholder for sending emails via Gmail."""
-    return f"Send email to {to} not yet implemented."

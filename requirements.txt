@@ -15,3 +15,6 @@ google-cloud-discoveryengine
 google-cloud-resource-manager
 google-cloud-service-usage
 google-cloud-dialogflow-cx
+google-cloud-pubsub
+scikit-learn
+numpy
