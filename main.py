@@ -110,6 +110,7 @@ def setup_agent_builder(project_id: str, location: str = "global"):
     """Provisions Vertex AI Agent Builder resources with idempotency check."""
     enable_gcp_api(project_id, "discoveryengine.googleapis.com")
     enable_gcp_api(project_id, "dialogflow.googleapis.com")
+    enable_gcp_api(project_id, "aiplatform.googleapis.com")
 
     parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
     
@@ -148,6 +149,20 @@ def setup_agent_builder(project_id: str, location: str = "global"):
             print(f"Found existing Engine: {engine_resource_id}")
             break
 
+    # fallback: Check Dialogflow Agents if engine not found directly
+    if not engine_resource_id:
+        try:
+            df_client = dialogflow.AgentsClient(client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"})
+            df_parent = f"projects/{project_id}/locations/{location}"
+            for agent in df_client.list_agents(parent=df_parent):
+                if agent.display_name == "Smart Email Manager":
+                    if agent.gen_app_builder_settings and agent.gen_app_builder_settings.engine:
+                        engine_resource_id = agent.gen_app_builder_settings.engine.split("/")[-1]
+                        print(f"Recovered Engine ID from Dialogflow Agent: {engine_resource_id}")
+                        break
+        except Exception as df_e:
+            print(f"Dialogflow Agent Lookup Note: {str(df_e)}")
+
     if not engine_resource_id:
         engine_resource_id = f"email-agent-{uuid.uuid4().hex[:6]}"
         engine_dict = {
@@ -163,9 +178,23 @@ def setup_agent_builder(project_id: str, location: str = "global"):
                 }
             }
         }
-        engine_operation = engine_client.create_engine(parent=parent, engine=engine_dict, engine_id=engine_resource_id)
-        engine_operation.result()
-        print(f"Created new Engine: {engine_resource_id}")
+        try:
+            engine_operation = engine_client.create_engine(parent=parent, engine=engine_dict, engine_id=engine_resource_id)
+            engine_operation.result()
+            print(f"Created new Engine: {engine_resource_id}")
+        except Exception as e:
+            if "AlreadyExists" in str(e) or "409" in str(e):
+                print(f"Engine or Agent already exists, attempting to recover...")
+                existing_engines = engine_client.list_engines(parent=parent)
+                for eng in existing_engines:
+                    if eng.display_name == "Smart Email Manager":
+                        engine_resource_id = eng.name.split("/")[-1]
+                        print(f"Recovered existing Engine: {engine_resource_id}")
+                        break
+                if not engine_resource_id:
+                    raise e
+            else:
+                raise e
 
     try:
         # Playbooks can be multiple, we try to create a fresh one or handle failure
