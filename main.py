@@ -133,6 +133,8 @@ def setup_agent_builder(project_id: str, location: str = "global"):
         "chat_engine_config": {
             "agent_creation_config": {
                 "business": "Smart Email Manager",
+                "default_language_code": "en",
+                "time_zone": "UTC"
             }
         }
     }
