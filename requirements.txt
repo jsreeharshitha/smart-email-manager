@@ -11,3 +11,6 @@ pydantic
 google-adk
 requests
 google-cloud-secret-manager
+google-cloud-discoveryengine
+google-cloud-resource-manager
+google-cloud-service-usage
