@@ -401,6 +401,30 @@ async def update_env(mongo_uri: str):
     print(f"CRITICAL: MONGO_URI updated to {mongo_uri}")
     return {"status": "success", "message": "Environment variable updated for this instance."}
 
+@app.post("/api/start-watch")
+async def start_gmail_watch(gmail_token: str, project_id: str):
+    """Starts the Gmail Watch from the backend to match the resource project identity."""
+    topic_name = f"projects/{project_id}/topics/gmail-notifications"
+    url = "https://gmail.googleapis.com/gmail/v1/users/me/watch"
+    headers = {
+        "Authorization": f"Bearer {gmail_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "topicName": topic_name,
+        "labelIds": ["INBOX"]
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            print(f"Backend Watch Error: {resp.text}")
+            raise HTTPException(status_code=resp.status_code, detail=resp.json())
+    except Exception as e:
+        print(f"Watch exception: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 async def root():
     return {"message": "Smart Email Manager Agent is running.", "status": "active"}
