@@ -285,6 +285,7 @@ async def setup_db_init(setup_request: MongoSetupRequest):
         return {
             "status": "db_provisioning",
             "mongo_project_id": mongo_project_id,
+            "db_pass": db_pass,
             "message": "Database cluster instantiation triggered."
         }
     except Exception as e:
@@ -394,12 +395,11 @@ async def verify_database(mongo_project_id: Optional[str] = None, public_key: Op
 
 @app.post("/api/update-env")
 async def update_env(mongo_uri: str):
-    """Fallback to set MONGO_URI in the current process and log for manual update."""
+    """Fallback to set MONGO_URI in the current process and update settings."""
     os.environ["MONGO_URI"] = mongo_uri
-    # In a real Cloud Run environment, this won't persist across restarts.
-    # The user should ideally run 'gcloud run services update'
+    settings.MONGO_URI = mongo_uri
     print(f"CRITICAL: MONGO_URI updated to {mongo_uri}")
-    return {"status": "success", "message": "Environment variable updated for this instance."}
+    return {"status": "success", "message": "Environment variable and settings updated."}
 
 @app.post("/api/check-connection")
 async def check_connection(gmail_token: str, project_id: str):
