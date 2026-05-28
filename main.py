@@ -335,27 +335,58 @@ async def handle_new_mail(request: Request):
         notification = json.loads(data_str)
         user_email = notification.get("emailAddress")
         new_history_id = notification.get("historyId")
+        
+        print(f"NOTIFICATION RECEIVED: {user_email} (History: {new_history_id})")
+
+        # Ensure we have a real MONGO_URI
+        if "agent.run.app" in settings.MONGO_URI or "localhost" in settings.MONGO_URI:
+            print("CRITICAL ERROR: MONGO_URI is still pointing to a placeholder!")
+            return {"status": "error", "message": "Invalid MONGO_URI"}
+
         client = get_client()
         db = client["smart_email_manager"]
+        
+        # Test connection with timeout
+        client.admin.command('ping')
+        
         user_session = db["UserSessions"].find_one({"user_email": user_email})
-        if not user_session: return {"status": "ignored"}
+        if not user_session:
+            print(f"SESSION NOT FOUND for {user_email}. Registering first history ID.")
+            db["UserSessions"].update_one(
+                {"user_email": user_email}, 
+                {"$set": {"last_history_id": new_history_id, "updated_at": datetime.now(UTC).isoformat()}}, 
+                upsert=True
+            )
+            return {"status": "initialized"}
+
         last_history_id = user_session.get("last_history_id")
         from tools.gmail_mcp import get_gmail_service
         gmail = get_gmail_service(user_email)
+        
         if not last_history_id:
+            print(f"UPDATING BASELINE HISTORY for {user_email}")
             db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
             return {"status": "initialized"}
+
+        print(f"FETCHING HISTORY since {last_history_id}")
         history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
+        
+        processed_count = 0
         for change in history_res.get("history", []):
             for item in change.get("messagesAdded", []):
                 msg_id = item.get("message", {}).get("id")
                 msg_detail = gmail.users().messages().get(userId="me", id=msg_id).execute()
-                metadata = {"subject": "New Mail", "message_id": msg_id, "user_email": user_email}
+                metadata = {"subject": msg_detail.get("snippet", "New Mail"), "message_id": msg_id, "user_email": user_email}
                 process_and_store_email(metadata, msg_detail.get("snippet", ""))
+                processed_count += 1
+        
+        print(f"SUCCESS: Processed {processed_count} emails.")
         db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
-        return {"status": "success"}
+        return {"status": "success", "processed": processed_count}
     except Exception as e:
-        return {"status": "error"}
+        print(f"ON-NEW-MAIL CRASH: {str(e)}")
+        print(traceback.format_exc())
+        return {"status": "error", "detail": str(e)}
 
 @app.get("/api/verify-db")
 async def verify_database(mongo_project_id: Optional[str] = None, public_key: Optional[str] = None, private_key: Optional[str] = None):
