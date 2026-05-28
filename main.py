@@ -438,7 +438,7 @@ async def check_connection(gmail_token: str, project_id: str):
     Checks if the backend is correctly linked to the user's Gmail.
     1. Verifies/Creates the Pub/Sub topic.
     2. Validates the Gmail Token identity.
-    3. Returns HANDSHAKE_REQUIRED if the 403 project-mismatch error occurs.
+    3. Auto-registers the User Session in MongoDB if missing.
     """
     # 1. Ensure Pub/Sub is ready
     try:
@@ -459,12 +459,33 @@ async def check_connection(gmail_token: str, project_id: str):
 
     try:
         resp = requests.post(url, json=payload, headers=headers)
+        
+        # 3. If Gmail accepts the token, ensure the session is in MongoDB
         if resp.status_code == 200:
+            try:
+                # Use the user email from the Gmail Profile (safest)
+                profile_res = requests.get("https://gmail.googleapis.com/gmail/v1/users/me/profile", headers=headers)
+                user_email = profile_res.json().get("emailAddress")
+                
+                client = get_client()
+                db = client["smart_email_manager"]
+                db["UserSessions"].update_one(
+                    {"user_email": user_email},
+                    {"$set": {
+                        "credentials": {"access_token": gmail_token},
+                        "last_watch_status": "active",
+                        "updated_at": datetime.now(UTC).isoformat()
+                    }}, upsert=True
+                )
+                print(f"SESSION AUTO-HEAL: Registered credentials for {user_email}")
+            except Exception as db_err:
+                print(f"SESSION AUTO-HEAL FAILED: {str(db_err)}")
+
             return {
                 "status": "connected",
                 "topic_ready": topic_ready,
                 "watch_active": True,
-                "message": "All systems green!"
+                "message": "All systems green! Credentials synchronized."
             }
         
         error_data = resp.json()
