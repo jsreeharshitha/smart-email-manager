@@ -154,19 +154,54 @@ def setup_agent_builder(project_id: str, location: str = "global"):
 
     if not engine_resource_id:
         engine_resource_id = f"email-agent-{uuid.uuid4().hex[:6]}"
-        engine_dict = {
-            "display_name": "Smart Email Manager",
-            "solution_type": "SOLUTION_TYPE_CHAT",
-            "data_store_ids": [ds_id],
-            "industry_vertical": "GENERIC",
-            "search_add_on_spec": {"add_on": "SEARCH_ADD_ON_ENTERPRISE"},
-            "chat_engine_config": {
-                "agent_creation_config": {"business": "Smart Email Manager", "default_language_code": "en", "time_zone": "UTC"}
+        
+        # Use REST API directly to bypass SDK schema issues for searchAddOnSpec
+        import google.auth
+        import google.auth.transport.requests
+        from google.oauth2 import service_account
+        
+        creds, project = google.auth.default()
+        auth_req = google.auth.transport.requests.Request()
+        creds.refresh(auth_req)
+        
+        url = f"https://discoveryengine.googleapis.com/v1beta/projects/{project_id}/locations/{location}/collections/default_collection/engines?engineId={engine_resource_id}"
+        headers = {
+            "Authorization": f"Bearer {creds.token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "displayName": "Smart Email Manager",
+            "solutionType": "SOLUTION_TYPE_CHAT",
+            "industryVertical": "GENERIC",
+            "dataStoreIds": [ds_id],
+            "searchAddOnSpec": {
+                "addOn": "SEARCH_ADD_ON_ENTERPRISE"
+            },
+            "chatEngineConfig": {
+                "agentCreationConfig": {
+                    "business": "Smart Email Manager",
+                    "defaultLanguageCode": "en",
+                    "timeZone": "UTC"
+                }
             }
         }
+        
         try:
-            engine_operation = engine_client.create_engine(parent=parent, engine=engine_dict, engine_id=engine_resource_id)
-            engine_operation.result()
+            resp = requests.post(url, json=payload, headers=headers)
+            if resp.status_code != 200:
+                # Fallback to recovery if it already exists despite our check
+                if "AlreadyExists" in resp.text or "409" in str(resp.status_code):
+                    print("Engine already exists (REST), recovering...")
+                    existing_engines = engine_client.list_engines(parent=parent)
+                    for eng in existing_engines:
+                        if eng.display_name == "Smart Email Manager":
+                            engine_resource_id = eng.name.split("/")[-1]
+                            break
+                else:
+                    print(f"REST Create Engine Error: {resp.text}")
+                    raise Exception(f"Failed to create engine: {resp.text}")
+            else:
+                print(f"Created new Engine (REST): {engine_resource_id}")
         except Exception as e:
             if "AlreadyExists" not in str(e): raise e
 
