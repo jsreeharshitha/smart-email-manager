@@ -174,8 +174,10 @@ def setup_agent_builder(project_id: str, location: str = "global"):
             "solutionType": "SOLUTION_TYPE_CHAT",
             "industryVertical": "GENERIC",
             "dataStoreIds": [ds_id],
-            "searchTier": "SEARCH_TIER_ENTERPRISE",
-            "searchAddOns": ["SEARCH_ADD_ON_LLM"],
+            "searchEngineConfig": {
+                "searchTier": "SEARCH_TIER_ENTERPRISE",
+                "searchAddOns": ["SEARCH_ADD_ON_LLM"]
+            },
             "chatEngineConfig": {
                 "agentCreationConfig": {
                     "business": "Smart Email Manager",
