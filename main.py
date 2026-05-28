@@ -401,6 +401,67 @@ async def update_env(mongo_uri: str):
     print(f"CRITICAL: MONGO_URI updated to {mongo_uri}")
     return {"status": "success", "message": "Environment variable updated for this instance."}
 
+@app.post("/api/check-connection")
+async def check_connection(gmail_token: str, project_id: str):
+    """
+    Checks if the backend is correctly linked to the user's Gmail.
+    1. Verifies/Creates the Pub/Sub topic.
+    2. Validates the Gmail Token identity.
+    3. Returns HANDSHAKE_REQUIRED if the 403 project-mismatch error occurs.
+    """
+    # 1. Ensure Pub/Sub is ready
+    try:
+        setup_pubsub(project_id)
+        topic_ready = True
+    except Exception as e:
+        print(f"PubSub Setup Check Error: {str(e)}")
+        topic_ready = False
+
+    # 2. Try to perform a minimal Gmail Watch call to test the "Identity"
+    topic_name = f"projects/{project_id}/topics/gmail-notifications"
+    url = "https://gmail.googleapis.com/gmail/v1/users/me/watch"
+    headers = {
+        "Authorization": f"Bearer {gmail_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {"topicName": topic_name, "labelIds": ["INBOX"]}
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers)
+        if resp.status_code == 200:
+            return {
+                "status": "connected",
+                "topic_ready": topic_ready,
+                "watch_active": True,
+                "message": "All systems green!"
+            }
+        
+        error_data = resp.json()
+        error_msg = str(error_data)
+        
+        # Detect the specific "Project 6833" error
+        if "68339103434" in error_msg:
+            return {
+                "status": "handshake_required",
+                "topic_ready": topic_ready,
+                "watch_active": False,
+                "message": "Cloud Shell Handshake required to link project identities."
+            }
+        
+        return {
+            "status": "error",
+            "topic_ready": topic_ready,
+            "watch_active": False,
+            "error_detail": error_data
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "topic_ready": topic_ready,
+            "watch_active": False,
+            "message": str(e)
+        }
+
 @app.post("/api/start-watch")
 async def start_gmail_watch(gmail_token: str, project_id: str):
     """Starts the Gmail Watch from the backend to match the resource project identity."""
