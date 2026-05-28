@@ -107,23 +107,20 @@ def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global
     return response.name
 
 def setup_agent_builder(project_id: str, location: str = "global"):
-    """Provisions Vertex AI Agent Builder resources with idempotency check."""
+    """Provisions Vertex AI Agent Builder resources with Enterprise features."""
     enable_gcp_api(project_id, "discoveryengine.googleapis.com")
     enable_gcp_api(project_id, "dialogflow.googleapis.com")
     enable_gcp_api(project_id, "aiplatform.googleapis.com")
 
     parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
     
-    # 1. Handle Data Store (Idempotent)
+    # ... (Data Store logic same) ...
     ds_client = discoveryengine.DataStoreServiceClient()
     ds_id = None
-    
-    # Check if a data store already exists
     existing_ds = ds_client.list_data_stores(parent=parent)
     for ds in existing_ds:
         if ds.display_name == "Email Knowledge Base":
             ds_id = ds.name.split("/")[-1]
-            print(f"Found existing Data Store: {ds_id}")
             break
             
     if not ds_id:
@@ -135,33 +132,25 @@ def setup_agent_builder(project_id: str, location: str = "global"):
         }
         ds_operation = ds_client.create_data_store(parent=parent, data_store=data_store_dict, data_store_id=ds_id)
         ds_operation.result()
-        print(f"Created new Data Store: {ds_id}")
 
     # 2. Handle Engine (Idempotent)
     engine_client = discoveryengine.EngineServiceClient()
     engine_resource_id = None
-    
-    # Check if an engine already exists
     existing_engines = engine_client.list_engines(parent=parent)
     for eng in existing_engines:
         if eng.display_name == "Smart Email Manager":
             engine_resource_id = eng.name.split("/")[-1]
-            print(f"Found existing Engine: {engine_resource_id}")
             break
 
-    # fallback: Check Dialogflow Agents if engine not found directly
+    # fallback: Check Dialogflow Agents
     if not engine_resource_id:
         try:
             df_client = dialogflow.AgentsClient(client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"})
-            df_parent = f"projects/{project_id}/locations/{location}"
-            for agent in df_client.list_agents(parent=df_parent):
-                if agent.display_name == "Smart Email Manager":
-                    if agent.gen_app_builder_settings and agent.gen_app_builder_settings.engine:
-                        engine_resource_id = agent.gen_app_builder_settings.engine.split("/")[-1]
-                        print(f"Recovered Engine ID from Dialogflow Agent: {engine_resource_id}")
-                        break
-        except Exception as df_e:
-            print(f"Dialogflow Agent Lookup Note: {str(df_e)}")
+            for agent in df_client.list_agents(parent=f"projects/{project_id}/locations/{location}"):
+                if agent.display_name == "Smart Email Manager" and agent.gen_app_builder_settings:
+                    engine_resource_id = agent.gen_app_builder_settings.engine.split("/")[-1]
+                    break
+        except Exception: pass
 
     if not engine_resource_id:
         engine_resource_id = f"email-agent-{uuid.uuid4().hex[:6]}"
@@ -170,38 +159,20 @@ def setup_agent_builder(project_id: str, location: str = "global"):
             "solution_type": "SOLUTION_TYPE_CHAT",
             "data_store_ids": [ds_id],
             "industry_vertical": "GENERIC",
+            "search_add_on_spec": {"add_on": "SEARCH_ADD_ON_ENTERPRISE"},
             "chat_engine_config": {
-                "agent_creation_config": {
-                    "business": "Smart Email Manager",
-                    "default_language_code": "en",
-                    "time_zone": "UTC"
-                }
+                "agent_creation_config": {"business": "Smart Email Manager", "default_language_code": "en", "time_zone": "UTC"}
             }
         }
         try:
             engine_operation = engine_client.create_engine(parent=parent, engine=engine_dict, engine_id=engine_resource_id)
             engine_operation.result()
-            print(f"Created new Engine: {engine_resource_id}")
         except Exception as e:
-            if "AlreadyExists" in str(e) or "409" in str(e):
-                print(f"Engine or Agent already exists, attempting to recover...")
-                existing_engines = engine_client.list_engines(parent=parent)
-                for eng in existing_engines:
-                    if eng.display_name == "Smart Email Manager":
-                        engine_resource_id = eng.name.split("/")[-1]
-                        print(f"Recovered existing Engine: {engine_resource_id}")
-                        break
-                if not engine_resource_id:
-                    raise e
-            else:
-                raise e
+            if "AlreadyExists" not in str(e): raise e
 
     try:
-        # Playbooks can be multiple, we try to create a fresh one or handle failure
         playbook_name = setup_agent_playbook(project_id, engine_resource_id, location)
-    except Exception as e:
-        print(f"Playbook Note (Already exists?): {str(e)}")
-        playbook_name = "existing-or-manual"
+    except Exception: playbook_name = "existing-or-manual"
 
     return {"data_store_id": ds_id, "engine_id": engine_resource_id, "playbook_name": playbook_name}
 
@@ -353,14 +324,49 @@ async def handle_new_mail(request: Request):
         return {"status": "error"}
 
 @app.get("/api/verify-db")
-async def verify_database():
-    try:
-        client = get_client()
-        # Admin command 'ping' is the standard way to check connectivity
-        client.admin.command('ping')
-        return {"status": "ready", "message": "Database is active and reachable."}
-    except Exception as e:
-        return {"status": "provisioning", "message": f"Database is not yet ready: {str(e)}"}
+async def verify_database(mongo_project_id: Optional[str] = None, public_key: Optional[str] = None, private_key: Optional[str] = None):
+    # 1. Check if we already have a URI and it works
+    if os.environ.get("MONGO_URI"):
+        try:
+            client = get_client()
+            client.admin.command('ping')
+            return {"status": "ready", "message": "Database is active and reachable."}
+        except Exception: pass
+
+    # 2. If no URI or ping failed, and we have credentials, try to fetch URI from Atlas
+    if mongo_project_id and public_key and private_key:
+        auth = HTTPDigestAuth(public_key, private_key)
+        headers = {"Accept": "application/vnd.atlas.2023-01-01+json"}
+        try:
+            url = f"https://cloud.mongodb.com/api/atlas/v2/groups/{mongo_project_id}/clusters/email-cluster"
+            res = requests.get(url, auth=auth, headers=headers)
+            data = res.json()
+            
+            if data.get("stateName") == "IDLE":
+                srv_uri = data["connectionStrings"]["standardSrv"]
+                # Note: SRV doesn't include user/pass, we need to inject them
+                # Our setup-db-init uses 'agent_user' and the generated pass. 
+                # For this prototype, we'll return the URI and let frontend/backend handle the merge.
+                return {
+                    "status": "ready_to_link", 
+                    "srv_uri": srv_uri,
+                    "message": "Cluster is ready. URI retrieved."
+                }
+            else:
+                return {"status": "provisioning", "message": f"Cluster state: {data.get('stateName', 'Unknown')}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Atlas API Error: {str(e)}"}
+
+    return {"status": "provisioning", "message": "Waiting for MONGO_URI environment variable."}
+
+@app.post("/api/update-env")
+async def update_env(mongo_uri: str):
+    """Fallback to set MONGO_URI in the current process and log for manual update."""
+    os.environ["MONGO_URI"] = mongo_uri
+    # In a real Cloud Run environment, this won't persist across restarts.
+    # The user should ideally run 'gcloud run services update'
+    print(f"CRITICAL: MONGO_URI updated to {mongo_uri}")
+    return {"status": "success", "message": "Environment variable updated for this instance."}
 
 @app.get("/")
 async def root():
