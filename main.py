@@ -84,27 +84,42 @@ def enable_gcp_api(project_id: str, service_name: str):
         print(f"API Enablement Warning for {service_name}: {str(e)}")
 
 def setup_agent_playbook(project_id: str, agent_id: str, location: str = "global"):
-    client = dialogflow.PlaybooksClient(client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"})
-    parent = f"projects/{project_id}/locations/{location}/agents/{agent_id}"
-    playbook = dialogflow.Playbook(
-        display_name="Smart Email Management Playbook",
-        goal="Automatically organize, label, and summarize the user's Gmail inbox using semantic reasoning and autonomous category discovery.",
-        instruction=dialogflow.Playbook.Instruction(
-            steps=[
-                dialogflow.Playbook.Step(text="Greet the user and explain your purpose as an AI Email Manager."),
-                dialogflow.Playbook.Step(text="Use the 'get_last_sync_timestamp' tool to check the status of the mailbox."),
-                dialogflow.Playbook.Step(text="If new emails are detected, use 'process_and_store_email' to index them into MongoDB."),
-                dialogflow.Playbook.Step(text="Proactively discover new categories by using the 'cluster_unclassified_emails' tool."),
-                dialogflow.Playbook.Step(text="For each identified cluster, analyze the representative email snippets to propose a 1-3 word Gmail label."),
-                dialogflow.Playbook.Step(text="Ask the user for permission before creating and applying new labels."),
-                dialogflow.Playbook.Step(text="If authorized, use 'create_label' and 'apply_label_to_email' to organize the inbox."),
-                dialogflow.Playbook.Step(text="Provide a summary of the organizational changes to the user.")
-            ]
+    try:
+        client = dialogflow.PlaybooksClient(client_options={"api_endpoint": f"{location}-dialogflow.googleapis.com"})
+        parent = f"projects/{project_id}/locations/{location}/agents/{agent_id}"
+        
+        # 1. Check if playbook already exists to prevent duplicates
+        try:
+            existing_playbooks = client.list_playbooks(parent=parent)
+            for p in existing_playbooks:
+                if p.display_name == "Smart Email Management Playbook":
+                    print(f"PLAYBOOK ALREADY EXISTS: {p.name}")
+                    return p.name
+        except Exception: pass
+
+        playbook = dialogflow.Playbook(
+            display_name="Smart Email Management Playbook",
+            goal="Automatically organize, label, and summarize the user's Gmail inbox using semantic reasoning and autonomous category discovery.",
+            instruction=dialogflow.Playbook.Instruction(
+                steps=[
+                    dialogflow.Playbook.Step(text="Greet the user and explain your purpose as an AI Email Manager."),
+                    dialogflow.Playbook.Step(text="Use the 'get_last_sync_timestamp' tool to check the status of the mailbox."),
+                    dialogflow.Playbook.Step(text="If new emails are detected, use 'process_and_store_email' to index them into MongoDB."),
+                    dialogflow.Playbook.Step(text="Proactively discover new categories by using the 'cluster_unclassified_emails' tool."),
+                    dialogflow.Playbook.Step(text="For each identified cluster, analyze the representative email snippets to propose a 1-3 word Gmail label."),
+                    dialogflow.Playbook.Step(text="Ask the user for permission before creating and applying new labels."),
+                    dialogflow.Playbook.Step(text="If authorized, use 'create_label' and 'apply_label_to_email' to organize the inbox."),
+                    dialogflow.Playbook.Step(text="Provide a summary of the organizational changes to the user.")
+                ]
+            )
         )
-    )
-    request = dialogflow.CreatePlaybookRequest(parent=parent, playbook=playbook)
-    response = client.create_playbook(request=request)
-    return response.name
+        request = dialogflow.CreatePlaybookRequest(parent=parent, playbook=playbook)
+        response = client.create_playbook(request=request)
+        print(f"PLAYBOOK CREATED SUCCESSFULLY: {response.name}")
+        return response.name
+    except Exception as e:
+        print(f"PLAYBOOK CREATION FAILED: {str(e)}")
+        raise e
 
 def setup_agent_builder(project_id: str, location: str = "global"):
     """Provisions Vertex AI Agent Builder resources with Enterprise features."""
@@ -369,7 +384,13 @@ async def handle_new_mail(request: Request):
             return {"status": "initialized"}
 
         print(f"FETCHING HISTORY since {last_history_id}")
-        history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
+        try:
+            history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
+        except Exception as auth_err:
+            if "expired" in str(auth_err).lower() or "401" in str(auth_err):
+                print(f"CRITICAL: Gmail Token for {user_email} has expired. User must click 'Verify & Link Inbox' in Sidebar to refresh.")
+                return {"status": "error", "message": "token_expired"}
+            raise auth_err
         
         processed_count = 0
         for change in history_res.get("history", []):
