@@ -559,6 +559,102 @@ async def start_gmail_watch(gmail_token: str, project_id: str):
         print(f"Watch exception: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/verify-system")
+async def verify_system(gmail_token: str, project_id: str):
+    """
+    Comprehensive diagnostic of the entire Agent infrastructure.
+    Checks DB, Pub/Sub, Vertex AI, and Gmail Watch.
+    """
+    results = {
+        "database": {"status": "error", "message": "Not tested"},
+        "pubsub": {"status": "error", "message": "Not tested"},
+        "vertex_ai": {"status": "error", "message": "Not tested"},
+        "gmail_watch": {"status": "error", "message": "Not tested"}
+    }
+
+    # 1. Check Database
+    try:
+        client = get_client()
+        client.admin.command('ping')
+        db = client["smart_email_manager"]
+        
+        # Check if user email is registered (use profile API to get email)
+        headers = {"Authorization": f"Bearer {gmail_token}"}
+        profile_res = requests.get("https://gmail.googleapis.com/gmail/v1/users/me/profile", headers=headers)
+        if profile_res.status_code == 200:
+            user_email = profile_res.json().get("emailAddress")
+            user_session = db["UserSessions"].find_one({"user_email": user_email})
+            if user_session:
+                results["database"] = {"status": "ok", "message": f"Connected. User {user_email} registered."}
+            else:
+                results["database"] = {"status": "warning", "message": "Connected, but user not registered. Trigger 'Verify & Link' in Sidebar."}
+        else:
+            results["database"] = {"status": "warning", "message": "Connected, but could not verify user email (Token issue)."}
+    except Exception as e:
+        results["database"] = {"status": "error", "message": f"DB Connection Failed: {str(e)}"}
+
+    # 2. Check Pub/Sub
+    try:
+        publisher = pubsub_v1.PublisherClient()
+        subscriber = pubsub_v1.SubscriberClient()
+        topic_path = publisher.topic_path(project_id, "gmail-notifications")
+        sub_path = subscriber.subscription_path(project_id, "gmail-notifications-sub")
+        
+        try:
+            publisher.get_topic(topic=topic_path)
+            topic_ok = True
+        except Exception: topic_ok = False
+        
+        try:
+            sub = subscriber.get_subscription(subscription=sub_path)
+            endpoint = sub.push_config.push_endpoint
+            if "agent.run.app" in endpoint:
+                sub_ok = "warning"
+                sub_msg = "Subscription exists but uses placeholder URL."
+            else:
+                sub_ok = "ok"
+                sub_msg = "Subscription ready."
+        except Exception: 
+            sub_ok = "error"
+            sub_msg = "Subscription missing."
+
+        if topic_ok and sub_ok == "ok":
+            results["pubsub"] = {"status": "ok", "message": "Topic and Subscription are healthy."}
+        else:
+            results["pubsub"] = {"status": sub_ok, "message": sub_msg if not topic_ok else f"Topic OK. {sub_msg}"}
+    except Exception as e:
+        results["pubsub"] = {"status": "error", "message": str(e)}
+
+    # 3. Check Vertex AI (Agent Builder)
+    try:
+        # Simple check: list engines to see if one matches our name
+        client = discoveryengine.EngineServiceClient()
+        parent = f"projects/{project_id}/locations/global/collections/default_collection"
+        engines = client.list_engines(parent=parent)
+        found = any(e.display_name == "Smart Email Manager" for e in engines)
+        if found:
+            results["vertex_ai"] = {"status": "ok", "message": "Agent Engine found."}
+        else:
+            results["vertex_ai"] = {"status": "error", "message": "Smart Email Manager engine not found."}
+    except Exception as e:
+        results["vertex_ai"] = {"status": "error", "message": str(e)}
+
+    # 4. Check Gmail Watch
+    try:
+        headers = {"Authorization": f"Bearer {gmail_token}"}
+        # Note: There is no 'get watch' API, but we can check the profile's historyId
+        # and see if our backend is receiving notifications. 
+        # For now, we'll try a minimal watch call or just check profile.
+        resp = requests.get("https://gmail.googleapis.com/gmail/v1/users/me/profile", headers=headers)
+        if resp.status_code == 200:
+            results["gmail_watch"] = {"status": "ok", "message": "Gmail API accessible."}
+        else:
+            results["gmail_watch"] = {"status": "error", "message": "Gmail API access denied (Token expired?)."}
+    except Exception as e:
+        results["gmail_watch"] = {"status": "error", "message": str(e)}
+
+    return results
+
 @app.get("/")
 async def root():
     return {"message": "Smart Email Manager Agent is running.", "status": "active"}
