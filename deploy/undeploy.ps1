@@ -20,13 +20,49 @@ gcloud pubsub topics delete gmail-notifications --quiet 2>$null
 Write-Host "🗑️ Deleting container images from GCR..." -ForegroundColor Yellow
 gcloud container images delete "gcr.io/$projectId/smart-email-manager-agent" --force-delete-tags --quiet 2>$null
 
-# 4. Vertex AI (Agent Builder) Instructions
-Write-Host "------------------------------------------------" -ForegroundColor White
-Write-Host "⚠️  Vertex AI (Agent Builder) Note:" -ForegroundColor Red
-Write-Host "Because Data Store and Engine IDs are generated dynamically,"
-Write-Host "it is recommended to delete them via the GCP Console:"
-Write-Host "1. Go to 'Agent Builder > Apps' and delete 'Smart Email Manager'."
-Write-Host "2. Go to 'Agent Builder > Data Stores' and delete 'Email Knowledge Base'."
-Write-Host "------------------------------------------------" -ForegroundColor White
+# 4. Delete Vertex AI (Agent Builder) Resources
+Write-Host "🗑️ Cleaning up Vertex AI resources..." -ForegroundColor Yellow
+$token = gcloud auth print-access-token
+
+$headers = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type"  = "application/json"
+}
+
+# Delete Engine
+$enginesUrl = "https://discoveryengine.googleapis.com/v1beta/projects/$projectId/locations/global/collections/default_collection/engines"
+try {
+    $enginesResponse = Invoke-RestMethod -Uri $enginesUrl -Method Get -Headers $headers
+    $engine = $enginesResponse.engines | Where-Object { $_.displayName -eq "Smart Email Manager" }
+    
+    if ($engine) {
+        $engineId = ($engine.name -split '/')[-1]
+        Write-Host "Deleting Engine: $engineId" -ForegroundColor Yellow
+        $deleteUrl = "https://discoveryengine.googleapis.com/v1beta/projects/$projectId/locations/global/collections/default_collection/engines/$engineId"
+        Invoke-RestMethod -Uri $deleteUrl -Method Delete -Headers $headers | Out-Null
+    } else {
+        Write-Host "Engine 'Smart Email Manager' not found." -ForegroundColor White
+    }
+} catch {
+    Write-Host "Error fetching engines: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Delete Data Store
+$dsUrl = "https://discoveryengine.googleapis.com/v1beta/projects/$projectId/locations/global/collections/default_collection/dataStores"
+try {
+    $dsResponse = Invoke-RestMethod -Uri $dsUrl -Method Get -Headers $headers
+    $ds = $dsResponse.dataStores | Where-Object { $_.displayName -eq "Email Knowledge Base" }
+    
+    if ($ds) {
+        $dsId = ($ds.name -split '/')[-1]
+        Write-Host "Deleting Data Store: $dsId" -ForegroundColor Yellow
+        $deleteDsUrl = "https://discoveryengine.googleapis.com/v1beta/projects/$projectId/locations/global/collections/default_collection/dataStores/$dsId"
+        Invoke-RestMethod -Uri $deleteDsUrl -Method Delete -Headers $headers | Out-Null
+    } else {
+        Write-Host "Data Store 'Email Knowledge Base' not found." -ForegroundColor White
+    }
+} catch {
+    Write-Host "Error fetching data stores: $($_.Exception.Message)" -ForegroundColor Red
+}
 
 Write-Host "✅ Cleanup tasks completed." -ForegroundColor Green
