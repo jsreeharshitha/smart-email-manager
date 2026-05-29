@@ -27,6 +27,7 @@ $token = gcloud auth print-access-token
 $headers = @{
     "Authorization" = "Bearer $token"
     "Content-Type"  = "application/json"
+    "x-goog-user-project" = $projectId
 }
 
 # Delete Engine

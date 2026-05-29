@@ -30,12 +30,14 @@ TOKEN=$(gcloud auth print-access-token)
 
 # Delete Engine
 ENGINE_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    -H "x-goog-user-project: $PROJECT_ID" \
     "https://discoveryengine.googleapis.com/v1beta/projects/$PROJECT_ID/locations/global/collections/default_collection/engines" \
     | grep -B 1 '"displayName": "Smart Email Manager"' | grep '"name":' | sed -E 's/.*\/engines\/([^"]+)".*/\1/')
 
 if [ ! -z "$ENGINE_ID" ]; then
     echo "Deleting Engine: $ENGINE_ID"
     curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+        -H "x-goog-user-project: $PROJECT_ID" \
         "https://discoveryengine.googleapis.com/v1beta/projects/$PROJECT_ID/locations/global/collections/default_collection/engines/$ENGINE_ID" > /dev/null
 else
     echo "Engine 'Smart Email Manager' not found."
@@ -43,12 +45,14 @@ fi
 
 # Delete Data Store
 DS_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    -H "x-goog-user-project: $PROJECT_ID" \
     "https://discoveryengine.googleapis.com/v1beta/projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores" \
     | grep -B 1 '"displayName": "Email Knowledge Base"' | grep '"name":' | sed -E 's/.*\/dataStores\/([^"]+)".*/\1/')
 
 if [ ! -z "$DS_ID" ]; then
     echo "Deleting Data Store: $DS_ID"
     curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
+        -H "x-goog-user-project: $PROJECT_ID" \
         "https://discoveryengine.googleapis.com/v1beta/projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores/$DS_ID" > /dev/null
 else
     echo "Data Store 'Email Knowledge Base' not found."
