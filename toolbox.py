@@ -10,6 +10,8 @@ from sklearn.cluster import KMeans
 from config import settings
 import vertexai
 from vertexai.generative_models import GenerativeModel
+from google.cloud import pubsub_v1
+import random
 
 # --- CORE BUSINESS LOGIC TOOLS ---
 
@@ -18,7 +20,6 @@ def generate_category_name(snippets: list) -> str:
     Uses Vertex AI (Gemini 3.5 Flash) to generate a concise category name from email snippets.
     """
     try:
-        # Initialize Vertex AI
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="us-central1")
         model = GenerativeModel("gemini-3.5-flash")
@@ -69,14 +70,13 @@ def reorganize_mails(user_email: str):
                 # Cleanup metadata and Gmail
                 for lbl in degraded_labels:
                     label_collection.delete_one({"user_email": user_email, "label_name": lbl})
-                    # Find label ID to delete
                     label_id = next((l["id"] for l in gmail_labels if l["name"] == lbl), None)
                     if label_id:
                         delete_label(user_email, label_id)
 
             # 4. Perform New Clustering
             clusters = cluster_unclassified_emails(user_email, n_clusters=5)
-            if isinstance(clusters, str): return clusters # Error message
+            if isinstance(clusters, str): return clusters
             
             for cluster in clusters:
                 # 5. Generate AI Name
@@ -85,15 +85,10 @@ def reorganize_mails(user_email: str):
                 
                 # 6. Create in Gmail and Apply
                 new_label = create_label(user_email, category_name)
+                if not new_label.get("id"): continue
                 
                 # 7. Bulk Update MongoDB & Gmail
-                email_ids = [rep["id"] for rep in cluster["representatives"]]
-                # Note: In a real scenario, we'd fetch ALL IDs in the cluster, not just reps.
-                # For this implementation, we'll label all emails currently in this cluster.
-                
-                # Get all email IDs in this cluster from the clustering results
-                # (Need to modify cluster_unclassified_emails to return all IDs)
-                # For now, let's use the representatives
+                email_ids = cluster["all_email_ids"]
                 for email_id in email_ids:
                     email_collection.update_one(
                         {"_id": email_id},
@@ -112,9 +107,6 @@ def reorganize_mails(user_email: str):
         print(f"Reorg Error: {str(e)}")
         return f"Error: {str(e)}"
 
-from google.cloud import pubsub_v1
-import random
-
 def incremental_update_label_integrity(user_email: str, label_name: str, new_embedding: list):
     """
     Efficiently updates label integrity. 
@@ -126,7 +118,6 @@ def incremental_update_label_integrity(user_email: str, label_name: str, new_emb
         meta = label_collection.find_one({"user_email": user_email, "label_name": label_name})
         
         if not meta:
-            # First email for this label, perform full init
             return update_label_integrity(user_email, label_name)
             
         old_avg = meta.get("semantic_integrity_score", 0.0)
@@ -160,7 +151,7 @@ def incremental_update_label_integrity(user_email: str, label_name: str, new_emb
         if new_integrity < 0.8:
             print(f"LABEL DEGRADED: {label_name} ({new_integrity}). Shredding...")
             
-            # Bulk Update: Set all emails to unclassified
+            # Bulk Update: Set all emails in this label to unclassified
             email_collection.update_many(
                 {"user_email": user_email, "label": label_name},
                 {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
@@ -197,7 +188,6 @@ def update_label_integrity(user_email: str, label_name: str):
         email_collection = get_collection()
         label_collection = get_collection("LabelMetadata")
         
-        # 1. Fetch all emails for this label
         query = {"user_email": user_email, "label": label_name}
         emails = list(email_collection.find(query, {"vector_embedding": 1, "_id": 1}))
         
@@ -205,16 +195,12 @@ def update_label_integrity(user_email: str, label_name: str):
             return f"No emails found for label {label_name}"
             
         vectors = np.array([e["vector_embedding"] for e in emails])
-        
-        # 2. Calculate Centroid (Mean Vector)
         centroid = np.mean(vectors, axis=0)
         
-        # 3. Calculate individual scores and overall integrity
         scores = []
         for email in emails:
             sim = calculate_cosine_similarity(email["vector_embedding"], centroid)
             scores.append(sim)
-            # Update individual email score
             email_collection.update_one(
                 {"_id": email["_id"]},
                 {"$set": {"email_semantic_score": float(sim)}}
@@ -222,7 +208,6 @@ def update_label_integrity(user_email: str, label_name: str):
             
         integrity_score = float(np.mean(scores))
         
-        # 4. Update Label Metadata
         label_collection.update_one(
             {"user_email": user_email, "label_name": label_name},
             {
@@ -258,7 +243,7 @@ def process_and_store_email(email_metadata: dict, email_body: str):
         "label": "unclassified",
         "email_semantic_score": 0.0,
         "processed_at": datetime.now(UTC).isoformat(),
-        "snippet": email_body[:200] # Store snippet for clustering previews
+        "snippet": email_body[:200]
     }
 
     return store_email_record(document)
@@ -283,11 +268,9 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
 
         clusters = []
         for i in range(n_clusters):
-            # Get ALL indices for this cluster
             cluster_indices = np.where(labels == i)[0]
             if len(cluster_indices) == 0: continue
             
-            # Find representatives (top 5 closest to centroid) for naming
             cluster_vectors = vectors[cluster_indices]
             distances = np.linalg.norm(cluster_vectors - centroids[i], axis=1)
             rep_indices = cluster_indices[np.argsort(distances)[:5]]
@@ -296,7 +279,6 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
             for idx in rep_indices:
                 reps.append({"id": str(emails[idx]["_id"]), "snippet": emails[idx].get("snippet", "")})
             
-            # Collect ALL email IDs in this cluster for bulk labeling
             all_ids = [str(emails[idx]["_id"]) for idx in cluster_indices]
             
             clusters.append({
