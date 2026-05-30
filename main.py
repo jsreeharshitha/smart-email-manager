@@ -147,17 +147,27 @@ async def handle_new_mail(request: Request):
         for change in history_res.get("history", []):
             for item in change.get("messagesAdded", []):
                 msg_id = item.get("message", {}).get("id")
-                msg_detail = gmail.users().messages().get(userId="me", id=msg_id).execute()
-                metadata = {
-                    "subject": msg_detail.get("snippet", "New Mail"), 
-                    "message_id": msg_id, 
-                    "user_email": user_email
-                }
-                process_and_store_email(metadata, msg_detail.get("snippet", ""))
-                processed_count += 1
-        
-        # Trigger initial reorg if no labels exist
+                try:
+                    msg_detail = gmail.users().messages().get(userId="me", id=msg_id).execute()
+                    metadata = {
+                        "subject": msg_detail.get("snippet", "New Mail"), 
+                        "message_id": msg_id, 
+                        "user_email": user_email
+                    }
+                    process_and_store_email(metadata, msg_detail.get("snippet", ""))
+                    processed_count += 1
+                except Exception as msg_err:
+                    # Handle 404 specifically: message might have been deleted or moved manually
+                    if "404" in str(msg_err):
+                        print(f"Skipping ghost message {msg_id}: Not found (likely deleted/moved manually).")
+                        continue
+                    else:
+                        print(f"Error processing message {msg_id}: {str(msg_err)}")
+                        continue
+
+        # After processing, trigger reorg check (e.g., if no sem_ labels exist yet)
         reorganize_mails(user_email)
+
         
         db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
         return {"status": "success", "processed": processed_count}
