@@ -18,13 +18,13 @@ from bson import ObjectId
 
 def generate_category_name(snippets: list) -> str:
     """
-    Uses Vertex AI (Gemini 1.5 Flash) to generate a concise category name from email snippets.
+    Uses Vertex AI (Gemini 3.5 Flash) to generate a concise category name from email snippets.
     """
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
-        vertexai.init(project=project_id, location="us-central1")
-        # Using a highly reliable model name
-        model = GenerativeModel("gemini-1.5-flash")
+        # Confirmed working settings: global location + gemini-3.5-flash
+        vertexai.init(project=project_id, location="global")
+        model = GenerativeModel("gemini-3.5-flash")
         
         prompt = f"""
         Analyze the following email snippets and provide a concise, 1-2 word category name 
@@ -51,9 +51,13 @@ def reorganize_mails(user_email: str):
     Workflow-Path-2 Orchestrator:
     1. Detects degraded labels (< 80% integrity).
     2. Resets emails to 'unclassified'.
-    3. Re-clusters and re-labels using AI.
+    3. Re-clusters and re-labels using AI (Gemini 3.5 Flash & 3.1 Pro).
     """
     try:
+        project_id = os.getenv("PROJECT_ID", "grah-2026")
+        # Confirmed working settings: global location
+        vertexai.init(project=project_id, location="global")
+        
         email_collection = get_collection()
         label_collection = get_collection("LabelMetadata")
         
