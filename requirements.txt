@@ -16,5 +16,6 @@ google-cloud-resource-manager
 google-cloud-service-usage
 google-cloud-dialogflow-cx
 google-cloud-pubsub
+google-cloud-aiplatform
 scikit-learn
 numpy

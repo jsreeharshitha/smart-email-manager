@@ -16,7 +16,12 @@ from pydantic import BaseModel
 from google.cloud import discoveryengine_v1beta as discoveryengine
 from google.cloud import pubsub_v1
 from datetime import datetime, UTC
-from fastapi import FastAPI, Request, HTTPException
+from toolbox import (
+    process_and_store_email, 
+    cluster_unclassified_emails, 
+    reorganize_mails, 
+    incremental_update_label_integrity
+)
 
 # --- 1. INITIALIZE FASTAPI ---
 app = FastAPI(title="Smart Email Manager API")
@@ -31,8 +36,11 @@ TOOLS = {
     "create_label": create_label,
     "get_labels": get_labels,
     "apply_label_to_email": apply_label_to_email,
-    "get_emails_by_id": get_emails_by_id
+    "get_emails_by_id": get_emails_by_id,
+    "reorganize_mails": reorganize_mails,
+    "incremental_update_label_integrity": incremental_update_label_integrity
 }
+
 
 # --- 2. MCP INTERFACE ENDPOINTS ---
 
@@ -59,6 +67,31 @@ async def call_mcp_tool(request: Request):
         return {"status": "error", "message": str(e)}
 
 # --- 3. CORE SERVICE ENDPOINTS ---
+
+@app.post("/api/reorganize")
+async def trigger_reorganize(request: Request):
+    """
+    Subscriber endpoint for the 'reorganize-inbox' Pub/Sub topic.
+    """
+    try:
+        envelope = await request.json()
+        import base64
+        pubsub_message = envelope.get("message", {})
+        data_str = base64.b64decode(pubsub_message.get("data", "")).decode("utf-8")
+        event = json.loads(data_str)
+        
+        user_email = event.get("user_email")
+        reason = event.get("reason")
+        
+        print(f"REORG EVENT RECEIVED for {user_email} (Reason: {reason})")
+        
+        # Execute the orchestrator
+        result = reorganize_mails(user_email)
+        return {"status": "success", "result": result}
+        
+    except Exception as e:
+        print(f"REORG TRIGGER ERROR: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 @app.post("/api/on-new-mail")
 async def handle_new_mail(request: Request):
@@ -125,6 +158,9 @@ async def handle_new_mail(request: Request):
                 }
                 process_and_store_email(metadata, msg_detail.get("snippet", ""))
                 processed_count += 1
+        
+        # After processing, trigger reorg check (e.g., if no sem_ labels exist yet)
+        reorganize_mails(user_email)
         
         print(f"SUCCESS: Processed {processed_count} emails.")
         db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})

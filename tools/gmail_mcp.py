@@ -60,9 +60,9 @@ def get_gmail_service(user_email: str):
         raise e
 
 @mcp.tool()
-def create_label(user_email: str, label_name: str) -> str:
+def create_label(user_email: str, label_name: str) -> dict:
     """
-    Creates a new custom label in Gmail.
+    Creates a new custom label in Gmail. Returns a dictionary with 'id' and 'name'.
     """
     try:
         service = get_gmail_service(user_email)
@@ -78,55 +78,76 @@ def create_label(user_email: str, label_name: str) -> str:
             body=label_object
         ).execute()
         
-        return f"Successfully created label: {created_label['name']} (ID: {created_label['id']})"
+        return {"id": created_label["id"], "name": created_label["name"]}
 
     except HttpError as error:
         if error.resp.status == 409:
-            return f"Error: The label '{label_name}' already exists."
-        return f"An error occurred: {error}"
+            # Handle existing label: fetch and return its ID
+            results = service.users().labels().list(userId='me').execute()
+            for l in results.get('labels', []):
+                if l['name'].lower() == label_name.lower():
+                    return {"id": l["id"], "name": l["name"]}
+        print(f"HttpError in create_label: {error}")
+        return {"id": None, "name": label_name, "error": str(error)}
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        print(f"Unexpected error in create_label: {str(e)}")
+        return {"id": None, "name": label_name, "error": str(e)}
 
 @mcp.tool()
-def get_labels(user_email: str) -> str:
+def delete_label(user_email: str, label_id: str) -> str:
     """
-    Retrieves all labels in the user's Gmail account.
+    Deletes a specific label from Gmail.
+    """
+    try:
+        service = get_gmail_service(user_email)
+        service.users().labels().delete(userId='me', id=label_id).execute()
+        return f"Successfully deleted label with ID: {label_id}"
+    except Exception as e:
+        return f"Error deleting label: {str(e)}"
+
+@mcp.tool()
+def get_labels(user_email: str) -> list:
+    """
+    Retrieves all labels in the user's Gmail account as a list of dictionaries.
+    Each dictionary contains 'id' and 'name'.
     """
     try:
         service = get_gmail_service(user_email)
         results = service.users().labels().list(userId='me').execute()
         labels = results.get('labels', [])
 
-        if not labels:
-            return "No labels found."
-        
-        output = "Gmail Labels:\n"
-        for label in labels:
-            output += f"- {label['name']} (ID: {label['id']})\n"
-        return output
+        return [{"id": l["id"], "name": l["name"]} for l in labels]
 
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        print(f"Error fetching labels: {str(e)}")
+        return []
 
 @mcp.tool()
-def apply_label_to_email(user_email: str, message_id: str, label_name: str) -> str:
+def apply_label_to_email(user_email: str, message_id: str, label_name_or_id: str) -> str:
     """
     Applies a label to a specific email message.
     """
     try:
         service = get_gmail_service(user_email)
         
+        # Determine if label_name_or_id is an ID or a name
+        # We'll fetch all labels to be safe
         results = service.users().labels().list(userId='me').execute()
         labels = results.get('labels', [])
         
         label_id = None
-        for label in labels:
-            if label['name'].lower() == label_name.lower():
-                label_id = label['id']
-                break
+        # Check if it matches an ID first
+        if any(l['id'] == label_name_or_id for l in labels):
+            label_id = label_name_or_id
+        else:
+            # Try to match by name
+            for label in labels:
+                if label['name'].lower() == label_name_or_id.lower():
+                    label_id = label['id']
+                    break
         
         if not label_id:
-            return f"Error: Label '{label_name}' not found."
+            return f"Error: Label '{label_name_or_id}' not found."
             
         service.users().messages().modify(
             userId='me',
