@@ -17,13 +17,13 @@ import random
 
 def generate_category_name(snippets: list) -> str:
     """
-    Uses Vertex AI (Gemini 3.5 Flash) to generate a concise category name from email snippets.
+    Uses Vertex AI (Gemini 1.5 Flash) to generate a concise category name from email snippets.
     """
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="us-central1")
-        # Gemini 3.5 Flash: Latest frontier model for rapid tasks
-        model = GenerativeModel("gemini-3.5-flash")
+        # Stable model ID
+        model = GenerativeModel("gemini-1.5-flash")
         
         prompt = f"""
         Analyze the following email snippets and provide a concise, 1-2 word category name 
@@ -43,13 +43,13 @@ def generate_category_name(snippets: list) -> str:
 def reorganize_mails(user_email: str):
     """
     Workflow-Path-2 Orchestrator:
-    Uses Gemini 3.1 Pro for high-reasoning categorization.
+    Uses Gemini 1.5 Flash for high-reasoning categorization.
     """
     try:
+        # Initialize with stable model
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="us-central1")
-        # Gemini 3.1 Pro: Specialized model for complex agentic workflows
-        orchestrator_model = GenerativeModel("gemini-3.1-pro-preview")
+        orchestrator_model = GenerativeModel("gemini-1.5-flash")
 
         email_collection = get_collection()
         label_collection = get_collection("LabelMetadata")
