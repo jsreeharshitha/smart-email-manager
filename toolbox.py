@@ -17,12 +17,12 @@ import random
 
 def generate_category_name(snippets: list) -> str:
     """
-    Uses Vertex AI (Gemini 3.5 Flash) to generate a concise category name from email snippets.
+    Uses Vertex AI (Gemini 1.5 Flash) to generate a concise category name from email snippets.
     """
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="us-central1")
-        model = GenerativeModel("gemini-3.5-flash")
+        model = GenerativeModel("gemini-1.5-flash")
         
         prompt = f"""
         Analyze the following email snippets and provide a concise, 1-2 word category name 
