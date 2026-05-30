@@ -17,10 +17,14 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly'
 ]
 
+import google.auth.transport.requests
+from google.auth.credentials import AnonymousCredentials
+
 def get_gmail_service(user_email: str):
     """
     Authenticates and returns the Gmail API service instance for a specific user.
-    Uses short-lived tokens from MongoDB (provided by Apps Script).
+    Uses short-lived tokens from MongoDB. 
+    Refactored to prevent automatic refresh crashes.
     """
     try:
         client = get_client()
@@ -28,17 +32,15 @@ def get_gmail_service(user_email: str):
         user_session = db["UserSessions"].find_one({"user_email": user_email})
 
         if not user_session or "credentials" not in user_session:
-            raise Exception(f"No Gmail credentials found for user: {user_email}. Please click 'Verify Installation' in the Sidebar.")
+            raise Exception(f"Auth token missing for {user_email}. Click 'Verify Installation' in Gmail Sidebar.")
 
-        creds_data = user_session["credentials"]
+        access_token = user_session["credentials"].get('access_token')
         
-        # Build credentials object. 
-        # Note: We don't provide refresh_token or client_id because we use Apps Script's short-lived tokens.
-        creds = Credentials(token=creds_data.get('access_token'))
-
-        # Check if we have an expiry date stored (optional enhancement)
-        # For now, we'll let the API call catch the 401.
+        # We create a simple Credentials object with ONLY the token.
+        # By NOT providing a refresh_token, we tell the library NOT to attempt a refresh.
+        creds = Credentials(token=access_token)
         
+        # We use a standard Request object but we will catch errors in the caller
         service = build('gmail', 'v1', credentials=creds)
         return service
 
