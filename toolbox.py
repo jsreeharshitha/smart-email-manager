@@ -12,7 +12,6 @@ import vertexai
 from vertexai.generative_models import GenerativeModel
 from google.cloud import pubsub_v1
 import random
-
 from bson import ObjectId
 
 # --- CORE BUSINESS LOGIC TOOLS ---
@@ -24,8 +23,8 @@ def generate_category_name(snippets: list) -> str:
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="us-central1")
-        # Trying a more robust model name or specific version
-        model = GenerativeModel("gemini-1.5-flash-002")
+        # Using a highly reliable model name
+        model = GenerativeModel("gemini-1.5-flash")
         
         prompt = f"""
         Analyze the following email snippets and provide a concise, 1-2 word category name 
@@ -37,28 +36,24 @@ def generate_category_name(snippets: list) -> str:
         """
         
         response = model.generate_content(prompt)
-        return response.text.strip().replace(" ", "-").lower()
+        # Cleanup response to ensure it's a valid label string
+        name = response.text.strip().replace(" ", "-").lower()
+        # Remove any non-alphanumeric chars except dashes
+        import re
+        name = re.sub(r'[^a-z0-9\-]', '', name)
+        return name if name else "uncategorized"
     except Exception as e:
-        print(f"Vertex AI Error: {str(e)}. Attempting fallback to gemini-1.5-flash.")
-        try:
-            model = GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(prompt)
-            return response.text.strip().replace(" ", "-").lower()
-        except:
-            print(f"Vertex AI Fallback failed.")
-            return f"cluster-{random.randint(100, 999)}"
+        print(f"Vertex AI Error: {str(e)}")
+        return f"cluster-{random.randint(100, 999)}"
 
 def reorganize_mails(user_email: str):
     """
     Workflow-Path-2 Orchestrator:
-    Uses Gemini 1.5 Flash for high-reasoning categorization.
+    1. Detects degraded labels (< 80% integrity).
+    2. Resets emails to 'unclassified'.
+    3. Re-clusters and re-labels using AI.
     """
     try:
-        # Initialize with stable model
-        project_id = os.getenv("PROJECT_ID", "grah-2026")
-        vertexai.init(project=project_id, location="us-central1")
-        orchestrator_model = GenerativeModel("gemini-1.5-flash-002")
-
         email_collection = get_collection()
         label_collection = get_collection("LabelMetadata")
         
@@ -87,6 +82,7 @@ def reorganize_mails(user_email: str):
                         delete_label(user_email, label_id)
 
             # 4. Perform New Clustering
+            # Dynamically adjust cluster count if we have few emails
             email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
             target_clusters = 5
             if email_count < 5 and email_count >= 2:
@@ -113,20 +109,23 @@ def reorganize_mails(user_email: str):
                     continue
                 
                 # 7. Apply to ALL emails in this cluster
-                email_ids = cluster["all_email_ids"]
-                print(f"Applying label {category_name} ({label_id}) to {len(email_ids)} emails...")
+                email_data_list = cluster["all_emails"]
+                print(f"Applying label {category_name} ({label_id}) to {len(email_data_list)} emails...")
                 
-                for email_id in email_ids:
+                for item in email_data_list:
+                    mongo_id = item["mongo_id"]
+                    gmail_id = item["gmail_id"]
+                    
                     # Update MongoDB (Handle ObjectId conversion)
                     email_collection.update_one(
-                        {"_id": ObjectId(email_id)}, 
+                        {"_id": ObjectId(mongo_id)}, 
                         {"$set": {"label": category_name}}
                     )
-                    # Update Gmail
+                    # Update Gmail (Use correct Gmail Message ID)
                     try:
-                        apply_label_to_email(user_email, email_id, label_id)
+                        apply_label_to_email(user_email, gmail_id, label_id)
                     except Exception as label_err:
-                        print(f"Error applying {category_name} to {email_id}: {str(label_err)}")
+                        print(f"Error applying {category_name} to {gmail_id}: {str(label_err)}")
                 
                 # 8. Initialize/Update Metadata for the new label
                 update_label_integrity(user_email, category_name)
@@ -221,7 +220,7 @@ def update_label_integrity(user_email: str, label_name: str):
         label_collection = get_collection("LabelMetadata")
         
         query = {"user_email": user_email, "label": label_name}
-        emails = list(email_collection.find(query, {"vector_embedding": 1, "_id": 1}))
+        emails = list(email_collection.find(query, {"vector_embedding": 1, "message_id": 1, "_id": 1}))
         
         if not emails:
             return f"No emails found for label {label_name}"
@@ -287,8 +286,9 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
     """
     try:
         collection = get_collection()
+        # Fetch both Mongo _id and Gmail message_id
         query = {"user_email": user_email, "label": "unclassified"}
-        emails = list(collection.find(query, {"_id": 1, "vector_embedding": 1, "subject": 1, "snippet": 1}))
+        emails = list(collection.find(query, {"_id": 1, "message_id": 1, "vector_embedding": 1, "subject": 1, "snippet": 1}))
 
         if len(emails) < n_clusters:
             return f"Not enough emails to form {n_clusters} clusters. Found {len(emails)}."
@@ -300,9 +300,11 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
 
         clusters = []
         for i in range(n_clusters):
+            # Get ALL indices for this cluster
             cluster_indices = np.where(labels == i)[0]
             if len(cluster_indices) == 0: continue
             
+            # Find representatives (top 5 closest to centroid) for naming
             cluster_vectors = vectors[cluster_indices]
             distances = np.linalg.norm(cluster_vectors - centroids[i], axis=1)
             rep_indices = cluster_indices[np.argsort(distances)[:5]]
@@ -311,13 +313,19 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
             for idx in rep_indices:
                 reps.append({"id": str(emails[idx]["_id"]), "snippet": emails[idx].get("snippet", "")})
             
-            all_ids = [str(emails[idx]["_id"]) for idx in cluster_indices]
+            # Collect ALL IDs in this cluster for bulk labeling
+            all_emails = []
+            for idx in cluster_indices:
+                all_emails.append({
+                    "mongo_id": str(emails[idx]["_id"]),
+                    "gmail_id": emails[idx].get("message_id")
+                })
             
             clusters.append({
                 "cluster_id": i,
                 "count": len(cluster_indices),
                 "representatives": reps,
-                "all_email_ids": all_ids
+                "all_emails": all_emails
             })
 
         return clusters
