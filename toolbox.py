@@ -13,6 +13,8 @@ from vertexai.generative_models import GenerativeModel
 from google.cloud import pubsub_v1
 import random
 
+from bson import ObjectId
+
 # --- CORE BUSINESS LOGIC TOOLS ---
 
 def generate_category_name(snippets: list) -> str:
@@ -22,8 +24,8 @@ def generate_category_name(snippets: list) -> str:
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="us-central1")
-        # Stable model ID
-        model = GenerativeModel("gemini-1.5-flash")
+        # Trying a more robust model name or specific version
+        model = GenerativeModel("gemini-1.5-flash-002")
         
         prompt = f"""
         Analyze the following email snippets and provide a concise, 1-2 word category name 
@@ -37,8 +39,14 @@ def generate_category_name(snippets: list) -> str:
         response = model.generate_content(prompt)
         return response.text.strip().replace(" ", "-").lower()
     except Exception as e:
-        print(f"Vertex AI Error: {str(e)}")
-        return f"cluster-{random.randint(100, 999)}"
+        print(f"Vertex AI Error: {str(e)}. Attempting fallback to gemini-1.5-flash.")
+        try:
+            model = GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip().replace(" ", "-").lower()
+        except:
+            print(f"Vertex AI Fallback failed.")
+            return f"cluster-{random.randint(100, 999)}"
 
 def reorganize_mails(user_email: str):
     """
@@ -49,7 +57,7 @@ def reorganize_mails(user_email: str):
         # Initialize with stable model
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="us-central1")
-        orchestrator_model = GenerativeModel("gemini-1.5-flash")
+        orchestrator_model = GenerativeModel("gemini-1.5-flash-002")
 
         email_collection = get_collection()
         label_collection = get_collection("LabelMetadata")
@@ -79,7 +87,6 @@ def reorganize_mails(user_email: str):
                         delete_label(user_email, label_id)
 
             # 4. Perform New Clustering
-            # Dynamically adjust cluster count if we have few emails
             email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
             target_clusters = 5
             if email_count < 5 and email_count >= 2:
@@ -110,9 +117,9 @@ def reorganize_mails(user_email: str):
                 print(f"Applying label {category_name} ({label_id}) to {len(email_ids)} emails...")
                 
                 for email_id in email_ids:
-                    # Update MongoDB
+                    # Update MongoDB (Handle ObjectId conversion)
                     email_collection.update_one(
-                        {"_id": email_id}, # Note: email_id is already a string from cluster_unclassified
+                        {"_id": ObjectId(email_id)}, 
                         {"$set": {"label": category_name}}
                     )
                     # Update Gmail
