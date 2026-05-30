@@ -165,6 +165,36 @@ async def handle_new_mail(request: Request):
         print(f"ON-NEW-MAIL CRASH: {str(e)}")
         return {"status": "error", "detail": str(e)}
 
+@app.post("/api/sync-credentials")
+async def sync_credentials(request: Request):
+    """
+    Endpoint to receive full persistent OAuth credentials from Cloud Shell.
+    """
+    try:
+        data = await request.json()
+        user_email = data.get("user_email")
+        creds = data.get("credentials")
+        
+        if not user_email or not creds:
+            raise HTTPException(status_code=400, detail="user_email and credentials are required.")
+
+        client = get_client()
+        db = client["smart_email_manager"]
+        
+        db["UserSessions"].update_one(
+            {"user_email": user_email},
+            {"$set": {
+                "credentials": creds,
+                "updated_at": datetime.now(UTC).isoformat()
+            }},
+            upsert=True
+        )
+        
+        return {"status": "success", "message": "Persistent credentials synchronized!"}
+    except Exception as e:
+        print(f"Sync Error: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
 @app.get("/api/verify-system")
 async def verify_system(gmail_token: str, project_id: str):
     """

@@ -17,14 +17,10 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly'
 ]
 
-import google.auth.transport.requests
-from google.auth.credentials import AnonymousCredentials
-
 def get_gmail_service(user_email: str):
     """
-    Authenticates and returns the Gmail API service instance for a specific user.
-    Uses short-lived tokens from MongoDB. 
-    Refactored to prevent automatic refresh crashes.
+    Authenticates and returns the Gmail API service instance.
+    Supports both short-lived tokens and persistent refresh tokens.
     """
     try:
         client = get_client()
@@ -32,20 +28,38 @@ def get_gmail_service(user_email: str):
         user_session = db["UserSessions"].find_one({"user_email": user_email})
 
         if not user_session or "credentials" not in user_session:
-            raise Exception(f"Auth token missing for {user_email}. Click 'Verify Installation' in Gmail Sidebar.")
+            raise Exception(f"Auth missing for {user_email}. Run the Sync script in Cloud Shell.")
 
-        access_token = user_session["credentials"].get('access_token')
+        creds_data = user_session["credentials"]
         
-        # We create a simple Credentials object with ONLY the token.
-        # By NOT providing a refresh_token, we tell the library NOT to attempt a refresh.
-        creds = Credentials(token=access_token)
-        
-        # We use a standard Request object but we will catch errors in the caller
-        service = build('gmail', 'v1', credentials=creds)
-        return service
+        # Build full credentials if refresh token is available
+        creds = Credentials(
+            token=creds_data.get('access_token'),
+            refresh_token=creds_data.get('refresh_token'),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=creds_data.get('client_id'),
+            client_secret=creds_data.get('client_secret'),
+            scopes=SCOPES
+        )
+
+        # Autonomously refresh if expired and we have the means
+        if creds.expired and creds.refresh_token:
+            print(f"Token expired for {user_email}. Attempting autonomous refresh...")
+            creds.refresh(Request())
+            # Save the new access token back to MongoDB
+            db["UserSessions"].update_one(
+                {"user_email": user_email},
+                {"$set": {
+                    "credentials.access_token": creds.token,
+                    "updated_at": datetime.now(UTC).isoformat()
+                }}
+            )
+            print("Autonomous refresh successful.")
+
+        return build('gmail', 'v1', credentials=creds)
 
     except Exception as e:
-        print(f"Gmail Auth Setup Error for {user_email}: {str(e)}")
+        print(f"Gmail Auth Error for {user_email}: {str(e)}")
         raise e
 
 @mcp.tool()
