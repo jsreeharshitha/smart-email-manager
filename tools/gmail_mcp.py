@@ -20,7 +20,7 @@ SCOPES = [
 def get_gmail_service(user_email: str):
     """
     Authenticates and returns the Gmail API service instance for a specific user.
-    Retrieves credentials from MongoDB UserSessions.
+    Uses short-lived tokens from MongoDB (provided by Apps Script).
     """
     try:
         client = get_client()
@@ -28,35 +28,22 @@ def get_gmail_service(user_email: str):
         user_session = db["UserSessions"].find_one({"user_email": user_email})
 
         if not user_session or "credentials" not in user_session:
-            # Fallback for local testing if credentials.json exists (optional, remove for pure production)
-            if os.path.exists('token.json'):
-                 creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-                 return build('gmail', 'v1', credentials=creds)
-            raise Exception(f"No Gmail credentials found for user: {user_email}.")
+            raise Exception(f"No Gmail credentials found for user: {user_email}. Please click 'Verify Installation' in the Sidebar.")
 
         creds_data = user_session["credentials"]
-        creds = Credentials(
-            token=creds_data.get('access_token'),
-            refresh_token=creds_data.get('refresh_token'),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=os.environ.get("GMAIL_CLIENT_ID"),
-            client_secret=os.environ.get("GMAIL_CLIENT_SECRET"),
-            scopes=SCOPES
-        )
+        
+        # Build credentials object. 
+        # Note: We don't provide refresh_token or client_id because we use Apps Script's short-lived tokens.
+        creds = Credentials(token=creds_data.get('access_token'))
 
-        # Refresh if expired
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            # Save the updated token back to MongoDB
-            db["UserSessions"].update_one(
-                {"user_email": user_email},
-                {"$set": {"credentials.access_token": creds.token, "updated_at": "auto-refreshed"}}
-            )
-
-        return build('gmail', 'v1', credentials=creds)
+        # Check if we have an expiry date stored (optional enhancement)
+        # For now, we'll let the API call catch the 401.
+        
+        service = build('gmail', 'v1', credentials=creds)
+        return service
 
     except Exception as e:
-        print(f"Gmail Auth Error for {user_email}: {str(e)}")
+        print(f"Gmail Auth Setup Error for {user_email}: {str(e)}")
         raise e
 
 @mcp.tool()
