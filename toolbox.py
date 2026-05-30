@@ -85,22 +85,34 @@ def reorganize_mails(user_email: str):
             for cluster in clusters:
                 # 5. Generate AI Name
                 snippets = [rep["snippet"] for rep in cluster["representatives"]]
-                category_name = "sem_" + generate_category_name(snippets)
+                raw_name = generate_category_name(snippets)
+                category_name = "sem_" + raw_name
                 
-                # 6. Create in Gmail and Apply
+                # 6. Create in Gmail (returns existing if already there)
                 new_label = create_label(user_email, category_name)
-                if not new_label.get("id"): continue
+                label_id = new_label.get("id")
                 
-                # 7. Bulk Update MongoDB & Gmail
+                if not label_id:
+                    print(f"Failed to create/find label {category_name}. Skipping cluster.")
+                    continue
+                
+                # 7. Apply to ALL emails in this cluster
                 email_ids = cluster["all_email_ids"]
+                print(f"Applying label {category_name} ({label_id}) to {len(email_ids)} emails...")
+                
                 for email_id in email_ids:
+                    # Update MongoDB
                     email_collection.update_one(
-                        {"_id": email_id},
+                        {"_id": email_id}, # Note: email_id is already a string from cluster_unclassified
                         {"$set": {"label": category_name}}
                     )
-                    apply_label_to_email(user_email, email_id, new_label["id"])
+                    # Update Gmail
+                    try:
+                        apply_label_to_email(user_email, email_id, label_id)
+                    except Exception as label_err:
+                        print(f"Error applying {category_name} to {email_id}: {str(label_err)}")
                 
-                # 8. Initialize Metadata for the new label
+                # 8. Initialize/Update Metadata for the new label
                 update_label_integrity(user_email, category_name)
                 
             return "Reorganization complete. Inbox optimized."
