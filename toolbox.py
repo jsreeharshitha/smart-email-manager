@@ -266,12 +266,66 @@ def update_label_integrity(user_email: str, label_name: str):
         print(f"Integrity Calculation Error: {str(e)}")
         return f"Error: {str(e)}"
 
+def auto_classify_mail(user_email: str, gmail_id: str, mongo_id: ObjectId, embedding: list):
+    """
+    Real-time Classifier: Compares new mail against existing healthy labels.
+    If similarity > 80%, classifies immediately.
+    """
+    try:
+        label_collection = get_collection("LabelMetadata")
+        email_collection = get_collection()
+        
+        # 1. Fetch all existing labels for this user
+        labels = list(label_collection.find({"user_email": user_email}))
+        if not labels:
+            return False
+
+        new_vec = np.array(embedding)
+        best_match = None
+        highest_score = 0.0
+
+        # 2. Find the closest centroid
+        for lbl in labels:
+            centroid = np.array(lbl["centroid_vector"])
+            score = calculate_cosine_similarity(new_vec, centroid)
+            if score > highest_score:
+                highest_score = score
+                best_match = lbl["label_name"]
+
+        # 3. Apply if above 80% threshold
+        if highest_score >= 0.8:
+            print(f"REAL-TIME MATCH: Email matched '{best_match}' with {highest_score:.2f} similarity.")
+            
+            # Update MongoDB
+            email_collection.update_one(
+                {"_id": mongo_id},
+                {"$set": {"label": best_match, "email_semantic_score": float(highest_score)}}
+            )
+            
+            # Update Gmail
+            gmail_labels = get_labels(user_email)
+            label_id = next((l["id"] for l in gmail_labels if l["name"] == best_match), None)
+            if label_id:
+                apply_label_to_email(user_email, gmail_id, label_id)
+                # 4. Trigger incremental update to keep centroid healthy
+                incremental_update_label_integrity(user_email, best_match, embedding)
+                return True
+                
+        return False
+    except Exception as e:
+        print(f"Auto-Classification Error: {str(e)}")
+        return False
+
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
-    Coordinates embedding generation and storage of an email in MongoDB.
+    Coordinates embedding generation and storage.
+    Now includes real-time classification attempt.
     """
+    user_email = email_metadata.get("user_email")
+    gmail_id = email_metadata.get("message_id")
     embedding = generate_embedding(email_body)
 
+    # Initial document
     document = {
         **email_metadata,
         "vector_embedding": embedding,
@@ -281,7 +335,15 @@ def process_and_store_email(email_metadata: dict, email_body: str):
         "snippet": email_body[:200]
     }
 
-    return store_email_record(document)
+    # Save to MongoDB first
+    res = store_email_record(document)
+    mongo_id = ObjectId(res.get("id")) if isinstance(res, dict) else None
+
+    # Attempt Real-time Classification
+    if mongo_id:
+        auto_classify_mail(user_email, gmail_id, mongo_id, embedding)
+
+    return res
 
 def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
     """
