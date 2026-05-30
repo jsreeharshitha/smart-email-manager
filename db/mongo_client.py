@@ -3,8 +3,14 @@ from pymongo.server_api import ServerApi
 from config import settings
 
 def get_client():
-    """Initializes and returns the MongoDB client."""
-    return MongoClient(settings.MONGO_URI, server_api=ServerApi('1'))
+    """Initializes and returns the MongoDB client with optimized handshake settings."""
+    return MongoClient(
+        settings.MONGO_URI, 
+        server_api=ServerApi('1'),
+        connectTimeoutMS=10000, # 10s limit for initial connection
+        retryWrites=True,
+        retryReads=True
+    )
 
 def get_collection(collection_name=None):
     """Initializes and returns a MongoDB collection."""
