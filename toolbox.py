@@ -79,8 +79,17 @@ def reorganize_mails(user_email: str):
                         delete_label(user_email, label_id)
 
             # 4. Perform New Clustering
-            clusters = cluster_unclassified_emails(user_email, n_clusters=5)
-            if isinstance(clusters, str): return clusters
+            # Dynamically adjust cluster count if we have few emails
+            email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
+            target_clusters = 5
+            if email_count < 5 and email_count >= 2:
+                target_clusters = 2
+                print(f"Low email count ({email_count}). Adjusting to {target_clusters} clusters.")
+            
+            clusters = cluster_unclassified_emails(user_email, n_clusters=target_clusters)
+            if isinstance(clusters, str): 
+                print(f"Reorg Aborted: {clusters}")
+                return clusters
             
             for cluster in clusters:
                 # 5. Generate AI Name
