@@ -6,6 +6,7 @@ from googleapiclient.errors import HttpError
 from mcp.server.fastmcp import FastMCP
 from db.mongo_client import get_client
 from config import settings
+from datetime import datetime, UTC
 
 # Initialize FastMCP for the Gmail Suite
 mcp = FastMCP("GmailSuite")
@@ -38,7 +39,6 @@ def get_gmail_service(user_email: str):
         creds = Credentials(token=access_token)
 
         # 2. Manual Expiry Check & Refresh
-        # We only attempt refresh if we have a refresh_token AND a client_id
         if creds.expired:
             if refresh_token and creds_data.get('client_id'):
                 print(f"Token expired for {user_email}. Attempting IMMORTAL refresh...")
@@ -62,7 +62,6 @@ def get_gmail_service(user_email: str):
                     print(f"Immortal Refresh Failed: {str(re_err)}")
             else:
                 print(f"Token expired for {user_email} and no refresh keys found. Operating in short-lived mode.")
-                # We return the expired creds so the API call fails with 401, which is handled gracefully.
         
         return build('gmail', 'v1', credentials=creds)
 
@@ -93,7 +92,6 @@ def create_label(user_email: str, label_name: str) -> dict:
 
     except HttpError as error:
         if error.resp.status == 409:
-            # Handle existing label: fetch and return its ID
             results = service.users().labels().list(userId='me').execute()
             for l in results.get('labels', []):
                 if l['name'].lower() == label_name.lower():
@@ -120,7 +118,6 @@ def delete_label(user_email: str, label_id: str) -> str:
 def get_labels(user_email: str) -> list:
     """
     Retrieves all labels in the user's Gmail account as a list of dictionaries.
-    Each dictionary contains 'id' and 'name'.
     """
     try:
         service = get_gmail_service(user_email)
@@ -136,36 +133,49 @@ def get_labels(user_email: str) -> list:
 @mcp.tool()
 def apply_label_to_email(user_email: str, message_id: str, label_name_or_id: str) -> str:
     """
-    Applies a label to a specific email message.
+    Problem 1 Fix: 'One-Label Lock'.
+    Strips all other 'sem_' labels before applying the new one.
     """
     try:
         service = get_gmail_service(user_email)
         
-        results = service.users().labels().list(userId='me').execute()
-        labels = results.get('labels', [])
+        # 1. Resolve target label ID
+        all_labels = get_labels(user_email)
+        target_label = next((l for l in all_labels if l['id'] == label_name_or_id or l['name'].lower() == label_name_or_id.lower()), None)
         
-        label_id = None
-        if any(l['id'] == label_name_or_id for l in labels):
-            label_id = label_name_or_id
-        else:
-            for label in labels:
-                if label['name'].lower() == label_name_or_id.lower():
-                    label_id = label['id']
-                    break
-        
-        if not label_id:
+        if not target_label:
             return f"Error: Label '{label_name_or_id}' not found."
             
+        target_id = target_label['id']
+        target_name = target_label['name']
+
+        # 2. Identify and strip other 'sem_' labels currently on the message
+        msg = service.users().messages().get(userId='me', id=message_id, format='minimal').execute()
+        current_label_ids = msg.get('labelIds', [])
+        
+        labels_to_remove = []
+        for lid in current_label_ids:
+            # Find the name for this ID
+            l_meta = next((l for l in all_labels if l['id'] == lid), None)
+            if l_meta and l_meta['name'].startswith('sem_') and lid != target_id:
+                labels_to_remove.append(lid)
+
+        # 3. Perform atomic swap
+        body = {'addLabelIds': [target_id]}
+        if labels_to_remove:
+            body['removeLabelIds'] = labels_to_remove
+            print(f"[*] One-Label Lock: Stripping {len(labels_to_remove)} sem_ labels from {message_id}")
+
         service.users().messages().modify(
             userId='me',
             id=message_id,
-            body={'addLabelIds': [label_id]}
+            body=body
         ).execute()
         
-        return f"Successfully applied label '{label_name_or_id}' to message {message_id}"
+        return f"Successfully applied '{target_name}' and locked email {message_id}"
 
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return f"Unexpected error in apply_label_to_email: {str(e)}"
 
 @mcp.tool()
 def remove_label_from_email(user_email: str, message_id: str, label_name_or_id: str) -> str:
@@ -174,29 +184,19 @@ def remove_label_from_email(user_email: str, message_id: str, label_name_or_id: 
     """
     try:
         service = get_gmail_service(user_email)
+        all_labels = get_labels(user_email)
+        target_label = next((l for l in all_labels if l['id'] == label_name_or_id or l['name'].lower() == label_name_or_id.lower()), None)
         
-        results = service.users().labels().list(userId='me').execute()
-        labels = results.get('labels', [])
-        
-        label_id = None
-        if any(l['id'] == label_name_or_id for l in labels):
-            label_id = label_name_or_id
-        else:
-            for label in labels:
-                if label['name'].lower() == label_name_or_id.lower():
-                    label_id = label['id']
-                    break
-        
-        if not label_id:
+        if not target_label:
             return f"Error: Label '{label_name_or_id}' not found."
             
         service.users().messages().modify(
             userId='me',
             id=message_id,
-            body={'removeLabelIds': [label_id]}
+            body={'removeLabelIds': [target_label['id']]}
         ).execute()
         
-        return f"Successfully removed label '{label_name_or_id}' from message {message_id}"
+        return f"Successfully removed label '{target_label['name']}' from message {message_id}"
 
     except Exception as e:
         return f"Unexpected error: {str(e)}"

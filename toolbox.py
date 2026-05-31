@@ -18,6 +18,7 @@ import re
 # --- CORE BUSINESS LOGIC TOOLS ---
 
 UNCLASSIFIED_LABEL = "sem_unclassified"
+MAX_SEMANTIC_LABELS = 5
 
 def get_sem_unclassified_id(user_email: str) -> str:
     """Helper to get or create the sem_unclassified label ID."""
@@ -53,8 +54,8 @@ def generate_category_name(snippets: list) -> str:
 def reorganize_mails(user_email: str):
     """
     Workflow-Path-2 Orchestrator:
-    1. Detects manual deletions in Gmail and syncs MongoDB.
-    2. Detects degraded labels (< 80% integrity).
+    1. Sync Guard: Handles manual deletions.
+    2. Problem 2 Fix: 'Hard Cap of 5'.
     3. Re-clusters and re-labels using Gemini 3.
     """
     try:
@@ -66,10 +67,10 @@ def reorganize_mails(user_email: str):
         
         # 1. Get Gmail State
         gmail_labels = get_labels(user_email)
-        active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_")]
+        active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_") and l["name"] != UNCLASSIFIED_LABEL]
         unclassified_id = get_sem_unclassified_id(user_email)
         
-        # 2. Sync Guard: Detect labels in DB that are missing in Gmail (Manual Deletions)
+        # 2. Sync Guard: Detect labels in DB that are missing in Gmail
         db_labels = email_collection.distinct("label", {"user_email": user_email})
         orphaned_labels = [l for l in db_labels if l.startswith("sem_") and l not in active_gmail_sem_labels and l != UNCLASSIFIED_LABEL]
         
@@ -80,28 +81,34 @@ def reorganize_mails(user_email: str):
         # Combine labels that need to be reset
         labels_to_shred = list(set(orphaned_labels + degraded_labels))
 
-        if not active_gmail_sem_labels or labels_to_shred:
-            print(f"REORG TRIGGERED for {user_email}.")
-            if orphaned_labels: print(f"-> Reason: Orphaned labels found in DB: {orphaned_labels}")
-            if degraded_labels: print(f"-> Reason: Degraded labels: {degraded_labels}")
-            if not active_gmail_sem_labels: print(f"-> Reason: No sem_ labels in Gmail.")
-
+        # Check if we should trigger reorg
+        if not active_gmail_sem_labels or labels_to_shred or len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
+            print(f"[*] REORG TRIGGERED for {user_email}.")
+            
             # 4. Shred Labels (Bulk Update)
-            if labels_to_shred:
+            # If we have too many labels, we shred them all to start fresh with exactly 5
+            all_to_shred = labels_to_shred if len(active_gmail_sem_labels) <= MAX_SEMANTIC_LABELS else active_gmail_sem_labels
+            
+            if all_to_shred:
                 email_collection.update_many(
-                    {"user_email": user_email, "label": {"$in": labels_to_shred}},
+                    {"user_email": user_email, "label": {"$in": all_to_shred}},
                     {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
                 )
-                label_collection.delete_many({"user_email": user_email, "label_name": {"$in": labels_to_shred}})
+                label_collection.delete_many({"user_email": user_email, "label_name": {"$in": all_to_shred}})
+                
+                # If we are over the cap, delete extra labels from Gmail
+                if len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
+                    for l_name in active_gmail_sem_labels:
+                        l_id = next((l["id"] for l in gmail_labels if l["name"] == l_name), None)
+                        if l_id: delete_label(user_email, l_id)
 
-            # 5. Perform New Clustering
+            # 5. Perform New Clustering (Capped at 5)
             email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
-            target_clusters = 5
-            if email_count < 5 and email_count >= 2:
-                target_clusters = 2
-                print(f"Low email count ({email_count}). Adjusting to {target_clusters} clusters.")
+            target_clusters = min(MAX_SEMANTIC_LABELS, max(2, email_count // 5 if email_count < 25 else 5))
             
+            print(f"[*] Clustering {email_count} emails into {target_clusters} groups...")
             clusters = cluster_unclassified_emails(user_email, n_clusters=target_clusters)
+            
             if isinstance(clusters, str): 
                 print(f"Reorg Aborted: {clusters}")
                 return clusters
@@ -117,10 +124,9 @@ def reorganize_mails(user_email: str):
                 label_id = new_label.get("id")
                 
                 if not label_id:
-                    print(f"Failed to create label {category_name}. Skipping cluster.")
                     continue
                 
-                # 8. Apply to ALL emails and REMOVE sem_unclassified
+                # 8. Apply to ALL emails (Problem 1 Fix: apply_label_to_email now locks to 1 label)
                 email_data_list = cluster["all_emails"]
                 for item in email_data_list:
                     mongo_id = item["mongo_id"]
@@ -139,9 +145,9 @@ def reorganize_mails(user_email: str):
                 # 9. Initialize Metadata
                 update_label_integrity(user_email, category_name)
                 
-            return "Reorganization complete."
+            return "Reorganization complete. Inbox balanced to 5 themes."
         
-        return "Inbox is healthy."
+        return "Inbox is healthy and balanced."
         
     except Exception as e:
         print(f"Reorg Error: {str(e)}")
@@ -150,7 +156,7 @@ def reorganize_mails(user_email: str):
 def incremental_update_label_integrity(user_email: str, label_name: str, new_embedding: list):
     """
     Efficiently updates label integrity. 
-    If score < 0.8, triggers immediate shredding and publishes reorg event.
+    If score < 0.8, triggers reorg via Pub/Sub.
     """
     try:
         label_collection = get_collection("LabelMetadata")
@@ -164,17 +170,13 @@ def incremental_update_label_integrity(user_email: str, label_name: str, new_emb
         old_centroid = np.array(meta.get("centroid_vector"))
         n = meta.get("email_count", 0)
         
-        # 1. Update Centroid incrementally
+        # 1. Update Centroid & Integrity
         new_vec = np.array(new_embedding)
         new_centroid = (old_centroid * n + new_vec) / (n + 1)
-        
-        # 2. Calculate New Email Similarity
         new_score = calculate_cosine_similarity(new_vec, new_centroid)
-        
-        # 3. Update Integrity Score incrementally
         new_integrity = (old_avg * n + new_score) / (n + 1)
         
-        # 4. Save updates
+        # 2. Save updates
         label_collection.update_one(
             {"user_email": user_email, "label_name": label_name},
             {
@@ -187,21 +189,16 @@ def incremental_update_label_integrity(user_email: str, label_name: str, new_emb
             }
         )
 
-        # 5. THRESHOLD GUARD: If integrity < 80%, SHRED and TRIGGER REORG
+        # 3. THRESHOLD GUARD: If integrity < 80%, SHRED and TRIGGER REORG
         if new_integrity < 0.8:
             print(f"LABEL DEGRADED: {label_name} ({new_integrity}). Shredding...")
-            
-            # Bulk Update: Set all emails in this label to unclassified
             email_collection.update_many(
                 {"user_email": user_email, "label": label_name},
                 {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
             )
-            
-            # Publish Event to Pub/Sub
             publisher = pubsub_v1.PublisherClient()
             project_id = os.getenv("PROJECT_ID", "grah-2026")
             topic_path = publisher.topic_path(project_id, "reorganize-inbox")
-            
             message_data = json.dumps({"user_email": user_email, "reason": f"degraded_{label_name}"})
             publisher.publish(topic_path, message_data.encode("utf-8"))
             
@@ -273,14 +270,14 @@ def update_label_integrity(user_email: str, label_name: str):
 
 def perform_batch_classification(user_email: str):
     """
-    Track 2: AGGRESSIVE Batch Classifier (Every 8th mail threshold).
-    Always assigns best match, even if < 80%. Self-healing handles degradation.
+    Track 2: AGGRESSIVE Batch Classifier.
+    Only classifies emails that ARE NOT already categorized.
     """
     try:
         label_collection = get_collection("LabelMetadata")
         email_collection = get_collection()
         
-        # 1. Fetch all unclassified emails
+        # 1. Fetch only emails that are 'unclassified' (Stability Rule)
         unclassified = list(email_collection.find({"user_email": user_email, "label": "unclassified"}))
         if not unclassified:
             return "No unclassified emails to process."
@@ -295,14 +292,11 @@ def perform_batch_classification(user_email: str):
         unclassified_id = get_sem_unclassified_id(user_email)
 
         match_count = 0
-        print(f"[*] Starting AGGRESSIVE Batch Classification for {len(unclassified)} emails...")
-
         for email in unclassified:
             new_vec = np.array(email["vector_embedding"])
             best_match_label = None
-            highest_score = -1.0 # Force a match even if zero
+            highest_score = -1.0
 
-            # Find best centroid match (Aggressive)
             for lbl in labels_meta:
                 centroid = np.array(lbl["centroid_vector"])
                 score = calculate_cosine_similarity(new_vec, centroid)
@@ -310,30 +304,24 @@ def perform_batch_classification(user_email: str):
                     highest_score = score
                     best_match_label = lbl["label_name"]
 
-            # Always apply the best match
+            # Always apply the best match (Aggressive but Stable)
             if best_match_label in label_map:
                 label_id = label_map[best_match_label]
                 gmail_id = email.get("message_id")
                 
-                print(f"    [+] AGGRESSIVE MATCH: Email {gmail_id} -> {best_match_label} (Score: {highest_score:.2f})")
-                
-                # Update MongoDB
                 email_collection.update_one(
                     {"_id": email["_id"]},
                     {"$set": {"label": best_match_label, "email_semantic_score": float(highest_score)}}
                 )
-                # Update Gmail
                 try:
                     apply_label_to_email(user_email, gmail_id, label_id)
                     if unclassified_id:
                         remove_label_from_email(user_email, gmail_id, unclassified_id)
-                    
-                    # Update label integrity (this will trigger reorg if score drops < 0.8)
                     incremental_update_label_integrity(user_email, best_match_label, email["vector_embedding"])
                     match_count += 1
                 except: continue
         
-        return f"Aggressive batch classification complete. Categorized {match_count} emails."
+        return f"Batch classification complete. Categorized {match_count} emails."
 
     except Exception as e:
         print(f"Aggressive Batch Classification Error: {str(e)}")
@@ -342,7 +330,6 @@ def perform_batch_classification(user_email: str):
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
     Coordinates embedding generation and storage.
-    Note: Classification handled by efficiency triggers in main.py.
     """
     embedding = generate_embedding(email_body)
 
@@ -355,18 +342,15 @@ def process_and_store_email(email_metadata: dict, email_body: str):
         "snippet": email_body[:200]
     }
 
-    # Save to MongoDB first
     res = store_email_record(document)
     
-    # Tag with sem_unclassified in Gmail immediately
     try:
         user_email = email_metadata.get("user_email")
         gmail_id = email_metadata.get("message_id")
         unclassified_id = get_sem_unclassified_id(user_email)
         if unclassified_id:
             apply_label_to_email(user_email, gmail_id, unclassified_id)
-    except Exception as e:
-        print(f"Error applying unclassified label: {str(e)}")
+    except: pass
 
     return res
 
