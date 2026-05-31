@@ -1,6 +1,6 @@
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from tools.embedding_tool import generate_embedding
-from db.mongo_client import get_collection
+from db.mongo_client import get_collection, get_client
 from tools.mongo_mcp import store_email_record, find_unclassified_by_semantic_group, setup_database
 from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id, delete_label, remove_label_from_email
 import json
@@ -19,6 +19,7 @@ import re
 
 UNCLASSIFIED_LABEL = "sem_unclassified"
 MAX_SEMANTIC_LABELS = 5
+REORG_COOLDOWN_HOURS = 1
 
 def get_sem_unclassified_id(user_email: str) -> str:
     """Helper to get or create the sem_unclassified label ID."""
@@ -27,7 +28,7 @@ def get_sem_unclassified_id(user_email: str) -> str:
 
 def generate_category_name(snippets: list) -> str:
     """
-    Uses Vertex AI (Gemini 3.5 Flash) to generate a concise category name from email snippets.
+    Uses Vertex AI (Gemini 3.5 Flash) to generate a concise category name.
     """
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
@@ -53,101 +54,109 @@ def generate_category_name(snippets: list) -> str:
 
 def reorganize_mails(user_email: str):
     """
-    Workflow-Path-2 Orchestrator:
-    1. Sync Guard: Handles manual deletions.
-    2. Problem 2 Fix: 'Hard Cap of 5'.
-    3. Re-clusters and re-labels using Gemini 3.
+    Workflow-Path-2 Orchestrator (Disciplined):
+    1. Cooldown Guard: Prevents infinite reorg loops.
+    2. Adaptive Thresholds: Sets a realistic bar for each label.
     """
     try:
+        client = get_client()
+        db = client[settings.DB_NAME]
+        email_collection = db["EmailData"]
+        label_collection = db["LabelMetadata"]
+        session_collection = db["UserSessions"]
+        
+        # --- 1. COOLDOWN GUARD ---
+        session = session_collection.find_one({"user_email": user_email})
+        if session and "last_reorganized_at" in session:
+            last_reorg = datetime.fromisoformat(session["last_reorganized_at"])
+            if datetime.now(UTC) - last_reorg < timedelta(hours=REORG_COOLDOWN_HOURS):
+                print(f"[*] REORG COOLDOWN ACTIVE for {user_email}. Skipping reorganization.")
+                return "Cooldown active. Skipping reorg."
+
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="global")
         
-        email_collection = get_collection()
-        label_collection = get_collection("LabelMetadata")
-        
-        # 1. Get Gmail State
+        # 2. Get Current State
         gmail_labels = get_labels(user_email)
         active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_") and l["name"] != UNCLASSIFIED_LABEL]
         unclassified_id = get_sem_unclassified_id(user_email)
         
-        # 2. Sync Guard: Detect labels in DB that are missing in Gmail
+        # Detect labels that need resetting
         db_labels = email_collection.distinct("label", {"user_email": user_email})
         orphaned_labels = [l for l in db_labels if l.startswith("sem_") and l not in active_gmail_sem_labels and l != UNCLASSIFIED_LABEL]
         
-        # 3. Identify Degraded Labels
         all_sem_meta = list(label_collection.find({"user_email": user_email}))
-        degraded_labels = [l["label_name"] for l in all_sem_meta if l["semantic_integrity_score"] < 0.8]
+        # Dynamic Check: Labels whose integrity is below their SPECIFIC adaptive threshold
+        degraded_labels = [l["label_name"] for l in all_sem_meta if l["semantic_integrity_score"] < l.get("threshold_score", 0.7)]
         
-        # Combine labels that need to be reset
         labels_to_shred = list(set(orphaned_labels + degraded_labels))
 
-        # Check if we should trigger reorg
         if not active_gmail_sem_labels or labels_to_shred or len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
-            print(f"[*] REORG TRIGGERED for {user_email}.")
-            
-            # 4. Shred Labels (Bulk Update)
-            # If we have too many labels, we shred them all to start fresh with exactly 5
-            all_to_shred = labels_to_shred if len(active_gmail_sem_labels) <= MAX_SEMANTIC_LABELS else active_gmail_sem_labels
-            
-            if all_to_shred:
+            print(f"[*] REORG STARTING for {user_email}...")
+
+            if labels_to_shred:
                 email_collection.update_many(
-                    {"user_email": user_email, "label": {"$in": all_to_shred}},
+                    {"user_email": user_email, "label": {"$in": labels_to_shred}},
                     {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
                 )
-                label_collection.delete_many({"user_email": user_email, "label_name": {"$in": all_to_shred}})
+                label_collection.delete_many({"user_email": user_email, "label_name": {"$in": labels_to_shred}})
                 
-                # If we are over the cap, delete extra labels from Gmail
                 if len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
                     for l_name in active_gmail_sem_labels:
                         l_id = next((l["id"] for l in gmail_labels if l["name"] == l_name), None)
                         if l_id: delete_label(user_email, l_id)
 
-            # 5. Perform New Clustering (Capped at 5)
+            # 3. Clustering (Capped at 5)
             email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
             target_clusters = min(MAX_SEMANTIC_LABELS, max(2, email_count // 5 if email_count < 25 else 5))
             
-            print(f"[*] Clustering {email_count} emails into {target_clusters} groups...")
             clusters = cluster_unclassified_emails(user_email, n_clusters=target_clusters)
-            
-            if isinstance(clusters, str): 
-                print(f"Reorg Aborted: {clusters}")
-                return clusters
+            if isinstance(clusters, str): return clusters
             
             for cluster in clusters:
-                # 6. Generate AI Name
+                # 4. Generate AI Name
                 snippets = [rep["snippet"] for rep in cluster["representatives"]]
                 raw_name = generate_category_name(snippets)
                 category_name = "sem_" + raw_name
                 
-                # 7. Create in Gmail
+                # 5. Create in Gmail
                 new_label = create_label(user_email, category_name)
                 label_id = new_label.get("id")
+                if not label_id: continue
                 
-                if not label_id:
-                    continue
-                
-                # 8. Apply to ALL emails (Problem 1 Fix: apply_label_to_email now locks to 1 label)
+                # 6. Apply & Lock
                 email_data_list = cluster["all_emails"]
                 for item in email_data_list:
                     mongo_id = item["mongo_id"]
                     gmail_id = item["gmail_id"]
-                    
-                    email_collection.update_one(
-                        {"_id": ObjectId(mongo_id)}, 
-                        {"$set": {"label": category_name}}
-                    )
+                    email_collection.update_one({"_id": ObjectId(mongo_id)}, {"$set": {"label": category_name}})
                     try:
                         apply_label_to_email(user_email, gmail_id, label_id)
-                        if unclassified_id:
-                            remove_label_from_email(user_email, gmail_id, unclassified_id)
+                        if unclassified_id: remove_label_from_email(user_email, gmail_id, unclassified_id)
                     except: continue
                 
-                # 9. Initialize Metadata
-                update_label_integrity(user_email, category_name)
-                
-            return "Reorganization complete. Inbox balanced to 5 themes."
+                # 7. ADAPTIVE THRESHOLD SETTING
+                # We calculate the starting integrity and set the threshold at 85% of that.
+                # This ensures we don't spiral if the data is naturally messy.
+                meta_res = update_label_integrity(user_email, category_name)
+                if isinstance(meta_res, dict):
+                    achieved_score = meta_res["integrity_score"]
+                    # Hysteresis: The bar is set lower than what we just achieved
+                    adaptive_threshold = max(0.6, achieved_score * 0.85)
+                    label_collection.update_one(
+                        {"user_email": user_email, "label_name": category_name},
+                        {"$set": {"threshold_score": adaptive_threshold}}
+                    )
+
+            # 8. UPDATE COOLDOWN
+            session_collection.update_one(
+                {"user_email": user_email},
+                {"$set": {"last_reorganized_at": datetime.now(UTC).isoformat()}},
+                upsert=True
+            )
+            return "Reorganization complete. System stabilized."
         
-        return "Inbox is healthy and balanced."
+        return "Inbox is healthy."
         
     except Exception as e:
         print(f"Reorg Error: {str(e)}")
@@ -156,7 +165,7 @@ def reorganize_mails(user_email: str):
 def incremental_update_label_integrity(user_email: str, label_name: str, new_embedding: list):
     """
     Efficiently updates label integrity. 
-    If score < 0.8, triggers reorg via Pub/Sub.
+    Uses ADAPTIVE THRESHOLDS to trigger reorg.
     """
     try:
         label_collection = get_collection("LabelMetadata")
@@ -170,13 +179,11 @@ def incremental_update_label_integrity(user_email: str, label_name: str, new_emb
         old_centroid = np.array(meta.get("centroid_vector"))
         n = meta.get("email_count", 0)
         
-        # 1. Update Centroid & Integrity
         new_vec = np.array(new_embedding)
         new_centroid = (old_centroid * n + new_vec) / (n + 1)
         new_score = calculate_cosine_similarity(new_vec, new_centroid)
         new_integrity = (old_avg * n + new_score) / (n + 1)
         
-        # 2. Save updates
         label_collection.update_one(
             {"user_email": user_email, "label_name": label_name},
             {
@@ -189,9 +196,10 @@ def incremental_update_label_integrity(user_email: str, label_name: str, new_emb
             }
         )
 
-        # 3. THRESHOLD GUARD: If integrity < 80%, SHRED and TRIGGER REORG
-        if new_integrity < 0.8:
-            print(f"LABEL DEGRADED: {label_name} ({new_integrity}). Shredding...")
+        # ADAPTIVE GUARD: Compare against the specific label's threshold
+        threshold = meta.get("threshold_score", 0.75) # Default to 75%
+        if new_integrity < threshold:
+            print(f"LABEL DEGRADED: {label_name} ({new_integrity} < {threshold}). Triggering Disciplined Reorg...")
             email_collection.update_many(
                 {"user_email": user_email, "label": label_name},
                 {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
@@ -219,7 +227,7 @@ def calculate_cosine_similarity(vec_a, vec_b):
 
 def update_label_integrity(user_email: str, label_name: str):
     """
-    Workflow-Path-2: Recalculates the centroid and integrity score for a specific label.
+    Recalculates the centroid and integrity score for a specific label.
     """
     try:
         email_collection = get_collection()
@@ -271,18 +279,15 @@ def update_label_integrity(user_email: str, label_name: str):
 def perform_batch_classification(user_email: str):
     """
     Track 2: AGGRESSIVE Batch Classifier.
-    Only classifies emails that ARE NOT already categorized.
     """
     try:
         label_collection = get_collection("LabelMetadata")
         email_collection = get_collection()
         
-        # 1. Fetch only emails that are 'unclassified' (Stability Rule)
         unclassified = list(email_collection.find({"user_email": user_email, "label": "unclassified"}))
         if not unclassified:
             return "No unclassified emails to process."
 
-        # 2. Fetch all label centroids
         labels_meta = list(label_collection.find({"user_email": user_email}))
         if not labels_meta:
             return "No existing labels to match against."
@@ -304,7 +309,6 @@ def perform_batch_classification(user_email: str):
                     highest_score = score
                     best_match_label = lbl["label_name"]
 
-            # Always apply the best match (Aggressive but Stable)
             if best_match_label in label_map:
                 label_id = label_map[best_match_label]
                 gmail_id = email.get("message_id")
@@ -356,7 +360,7 @@ def process_and_store_email(email_metadata: dict, email_body: str):
 
 def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
     """
-    Workflow-2: Performs K-Means clustering on unclassified emails in MongoDB.
+    Workflow-2: Performs K-Means clustering.
     Returns all email IDs grouped by cluster.
     """
     try:
