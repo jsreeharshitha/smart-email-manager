@@ -2,7 +2,7 @@ from datetime import datetime, UTC
 from tools.embedding_tool import generate_embedding
 from db.mongo_client import get_collection
 from tools.mongo_mcp import store_email_record, find_unclassified_by_semantic_group, setup_database
-from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id, delete_label
+from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id, delete_label, remove_label_from_email
 import json
 import os
 import numpy as np
@@ -16,6 +16,13 @@ from bson import ObjectId
 import re
 
 # --- CORE BUSINESS LOGIC TOOLS ---
+
+UNCLASSIFIED_LABEL = "sem_unclassified"
+
+def get_sem_unclassified_id(user_email: str) -> str:
+    """Helper to get or create the sem_unclassified label ID."""
+    res = create_label(user_email, UNCLASSIFIED_LABEL)
+    return res.get("id")
 
 def generate_category_name(snippets: list) -> str:
     """
@@ -60,10 +67,11 @@ def reorganize_mails(user_email: str):
         # 1. Get Gmail State
         gmail_labels = get_labels(user_email)
         active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_")]
+        unclassified_id = get_sem_unclassified_id(user_email)
         
         # 2. Sync Guard: Detect labels in DB that are missing in Gmail (Manual Deletions)
         db_labels = email_collection.distinct("label", {"user_email": user_email})
-        orphaned_labels = [l for l in db_labels if l.startswith("sem_") and l not in active_gmail_sem_labels]
+        orphaned_labels = [l for l in db_labels if l.startswith("sem_") and l not in active_gmail_sem_labels and l != UNCLASSIFIED_LABEL]
         
         # 3. Identify Degraded Labels
         all_sem_meta = list(label_collection.find({"user_email": user_email}))
@@ -112,7 +120,7 @@ def reorganize_mails(user_email: str):
                     print(f"Failed to create label {category_name}. Skipping cluster.")
                     continue
                 
-                # 8. Apply to ALL emails
+                # 8. Apply to ALL emails and REMOVE sem_unclassified
                 email_data_list = cluster["all_emails"]
                 for item in email_data_list:
                     mongo_id = item["mongo_id"]
@@ -124,6 +132,8 @@ def reorganize_mails(user_email: str):
                     )
                     try:
                         apply_label_to_email(user_email, gmail_id, label_id)
+                        if unclassified_id:
+                            remove_label_from_email(user_email, gmail_id, unclassified_id)
                     except: continue
                 
                 # 9. Initialize Metadata
@@ -263,7 +273,7 @@ def update_label_integrity(user_email: str, label_name: str):
 
 def perform_batch_classification(user_email: str):
     """
-    Track 2: Batch Classifier (Every 10th mail efficiency).
+    Track 2: Batch Classifier (Every 25th mail threshold).
     Performs vector search logic across all unclassified mails against all existing label centroids.
     Assigns the 'max label' that scores above 80%.
     """
@@ -283,6 +293,7 @@ def perform_batch_classification(user_email: str):
 
         gmail_labels = get_labels(user_email)
         label_map = {l["name"]: l["id"] for l in gmail_labels if l["name"].startswith("sem_")}
+        unclassified_id = get_sem_unclassified_id(user_email)
 
         match_count = 0
         print(f"[*] Starting Batch Classification for {len(unclassified)} emails...")
@@ -315,6 +326,8 @@ def perform_batch_classification(user_email: str):
                 # Update Gmail
                 try:
                     apply_label_to_email(user_email, gmail_id, label_id)
+                    if unclassified_id:
+                        remove_label_from_email(user_email, gmail_id, unclassified_id)
                     match_count += 1
                 except: continue
         
@@ -327,10 +340,13 @@ def perform_batch_classification(user_email: str):
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
     Coordinates embedding generation and storage.
-    Note: Real-time classification is now handled in batches by perform_batch_classification.
+    Automatically applies sem_unclassified label in Gmail.
     """
+    user_email = email_metadata.get("user_email")
+    gmail_id = email_metadata.get("message_id")
     embedding = generate_embedding(email_body)
 
+    # Initial document
     document = {
         **email_metadata,
         "vector_embedding": embedding,
@@ -340,8 +356,18 @@ def process_and_store_email(email_metadata: dict, email_body: str):
         "snippet": email_body[:200]
     }
 
-    # Save to MongoDB
-    return store_email_record(document)
+    # Save to MongoDB first
+    res = store_email_record(document)
+    
+    # Tag with sem_unclassified in Gmail immediately
+    try:
+        unclassified_id = get_sem_unclassified_id(user_email)
+        if unclassified_id:
+            apply_label_to_email(user_email, gmail_id, unclassified_id)
+    except Exception as e:
+        print(f"Error applying unclassified label: {str(e)}")
+
+    return res
 
 def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
     """

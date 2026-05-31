@@ -141,17 +141,13 @@ def apply_label_to_email(user_email: str, message_id: str, label_name_or_id: str
     try:
         service = get_gmail_service(user_email)
         
-        # Determine if label_name_or_id is an ID or a name
-        # We'll fetch all labels to be safe
         results = service.users().labels().list(userId='me').execute()
         labels = results.get('labels', [])
         
         label_id = None
-        # Check if it matches an ID first
         if any(l['id'] == label_name_or_id for l in labels):
             label_id = label_name_or_id
         else:
-            # Try to match by name
             for label in labels:
                 if label['name'].lower() == label_name_or_id.lower():
                     label_id = label['id']
@@ -166,7 +162,41 @@ def apply_label_to_email(user_email: str, message_id: str, label_name_or_id: str
             body={'addLabelIds': [label_id]}
         ).execute()
         
-        return f"Successfully applied label '{label_name}' to message {message_id}"
+        return f"Successfully applied label '{label_name_or_id}' to message {message_id}"
+
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
+
+@mcp.tool()
+def remove_label_from_email(user_email: str, message_id: str, label_name_or_id: str) -> str:
+    """
+    Removes a label from a specific email message.
+    """
+    try:
+        service = get_gmail_service(user_email)
+        
+        results = service.users().labels().list(userId='me').execute()
+        labels = results.get('labels', [])
+        
+        label_id = None
+        if any(l['id'] == label_name_or_id for l in labels):
+            label_id = label_name_or_id
+        else:
+            for label in labels:
+                if label['name'].lower() == label_name_or_id.lower():
+                    label_id = label['id']
+                    break
+        
+        if not label_id:
+            return f"Error: Label '{label_name_or_id}' not found."
+            
+        service.users().messages().modify(
+            userId='me',
+            id=message_id,
+            body={'removeLabelIds': [label_id]}
+        ).execute()
+        
+        return f"Successfully removed label '{label_name_or_id}' from message {message_id}"
 
     except Exception as e:
         return f"Unexpected error: {str(e)}"

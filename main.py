@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, HTTPException
 from db.mongo_client import get_client, get_collection
 from config import settings
 from tools.mongo_mcp import get_last_sync_timestamp, setup_database, find_unclassified_by_semantic_group, store_email_record
-from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id
+from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id, remove_label_from_email
 from typing import List, Optional
 from pydantic import BaseModel
 from google.cloud import discoveryengine_v1beta as discoveryengine
@@ -37,6 +37,7 @@ TOOLS = {
     "create_label": create_label,
     "get_labels": get_labels,
     "apply_label_to_email": apply_label_to_email,
+    "remove_label_from_email": remove_label_from_email,
     "get_emails_by_id": get_emails_by_id,
     "reorganize_mails": reorganize_mails,
     "incremental_update_label_integrity": incremental_update_label_integrity,
@@ -63,7 +64,7 @@ async def call_mcp_tool(request: Request):
         if tool_name not in TOOLS:
             raise HTTPException(status_code=404, detail=f"Tool {tool_name} not found.")
         
-        # Tool execution (all tools in toolbox and mcp are synchronous in this version)
+        # Tool execution
         result = TOOLS[tool_name](**arguments)
         return {"status": "success", "result": result}
     except Exception as e:
@@ -120,6 +121,7 @@ async def handle_new_mail(request: Request):
 
         client = get_client()
         db = client["smart_email_manager"]
+        email_collection = db["EmailData"]
         
         user_session = db["UserSessions"].find_one({"user_email": user_email})
         if not user_session:
@@ -129,7 +131,6 @@ async def handle_new_mail(request: Request):
                 {"$set": {"last_history_id": new_history_id, "updated_at": datetime.now(UTC).isoformat()}}, 
                 upsert=True
             )
-            # PROACTIVE: Even on baseline setup, check if we need to organize existing data
             reorganize_mails(user_email)
             return {"status": "initialized_and_reorganized"}
 
@@ -163,26 +164,21 @@ async def handle_new_mail(request: Request):
                     }
                     process_and_store_email(metadata, msg_detail.get("snippet", ""))
                     processed_count += 1
-                    
-                    # Track 2 Trigger: Batch Classification every 10th email for efficiency
-                    if processed_count % 10 == 0:
-                        print(f"[*] Efficiency Trigger: Running batch classification for {user_email}...")
-                        perform_batch_classification(user_email)
-
                 except Exception as msg_err:
-                    # Handle 404 specifically: message might have been deleted or moved manually
                     if "404" in str(msg_err):
-                        print(f"Skipping ghost message {msg_id}: Not found (likely deleted/moved manually).")
+                        print(f"Skipping ghost message {msg_id}: Not found.")
                         continue
                     else:
                         print(f"Error processing message {msg_id}: {str(msg_err)}")
                         continue
 
-        # After processing, trigger reorg check (e.g., if no sem_ labels exist yet)
+        # After processing, trigger reorg check
         reorganize_mails(user_email)
         
-        # Final cleanup classification for any remaining unclassified mail from this batch
-        if processed_count > 0:
+        # Track 2: Efficiency Trigger - Check unclassified count
+        unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
+        if unclassified_count >= 25:
+            print(f"[*] Threshold Reached ({unclassified_count}). Running batch classification for {user_email}...")
             perform_batch_classification(user_email)
         
         db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
@@ -225,7 +221,6 @@ async def sync_credentials(request: Request):
 async def verify_system(gmail_token: str, project_id: str):
     """
     Comprehensive diagnostic of the entire Agent infrastructure.
-    Refactored to be faster and avoid timeouts.
     """
     results = {
         "database": {"status": "error", "message": "Not tested"},
@@ -234,21 +229,14 @@ async def verify_system(gmail_token: str, project_id: str):
         "gmail_watch": {"status": "error", "message": "Not tested"}
     }
 
-    # 1. Quick Database Ping
     try:
         client = get_client()
-        # Set a short timeout for the ping
         client.admin.command('ping', serverSelectionTimeoutMS=2000)
         db = client["smart_email_manager"]
-        
-        # Verify user session exists without heavy API calls
-        # We'll just assume the token is OK if we can reach the DB and find a user
-        # (Detailed profile fetching is too slow for verification)
         results["database"] = {"status": "ok", "message": "Connected to MongoDB Atlas."}
     except Exception as e:
         results["database"] = {"status": "error", "message": f"DB Connection Failed: {str(e)}"}
 
-    # 2. Check Pub/Sub (Fast Metadata check)
     try:
         publisher = pubsub_v1.PublisherClient()
         subscriber = pubsub_v1.SubscriberClient()
@@ -270,22 +258,17 @@ async def verify_system(gmail_token: str, project_id: str):
     except Exception as e:
         results["pubsub"] = {"status": "error", "message": "Pub/Sub check timed out"}
 
-    # 3. Check Vertex AI (Fast Engine check)
     try:
-        # Use a more direct check or set a strict timeout
         client = discoveryengine.EngineServiceClient()
         parent = f"projects/{project_id}/locations/global/collections/default_collection"
-        # We only check if we can list, not exhaustive search
         engines = client.list_engines(parent=parent, timeout=5)
         found = any(e.display_name == "Smart Email Manager" for e in engines)
         results["vertex_ai"] = {"status": "ok" if found else "error"}
     except Exception as e:
         results["vertex_ai"] = {"status": "error", "message": "Vertex AI check timed out"}
 
-    # 4. Check Gmail Token (Fastest possible call)
     try:
         headers = {"Authorization": f"Bearer {gmail_token}"}
-        # Use a lightweight HEAD request to the profile endpoint
         resp = requests.head("https://gmail.googleapis.com/gmail/v1/users/me/profile", headers=headers, timeout=3)
         results["gmail_watch"] = {"status": "ok" if resp.status_code == 200 else "error"}
     except Exception:
