@@ -58,23 +58,38 @@ def setup_database() -> str:
         return f"Error during database setup: {str(e)}"
 
 @mcp.tool()
-def store_email_record(document: dict) -> str:
+def store_email_record(document: dict) -> dict:
     """
-    Stores an email document in the MongoDB EmailData collection.
-    
-    Args:
-        document (dict): The email document with embeddings, metadata, and body.
+    Stores or updates an email document in the MongoDB EmailData collection.
+    Uses 'upsert' based on message_id to prevent duplicates.
     """
     try:
         collection = get_collection()
-        # Ensure UTC timestamp if not present
+        msg_id = document.get("message_id")
+        
+        if not msg_id:
+            raise Exception("Document must contain a 'message_id' for deduplication.")
+
         if "processed_at" not in document:
-            document["processed_at"] = datetime.now(UTC)
+            document["processed_at"] = datetime.now(UTC).isoformat()
             
-        insert_result = collection.insert_one(document)
-        return f"Successfully stored email in MongoDB with ID: {insert_result.inserted_id}"
+        # 1. Perform Upsert (Replace if exists, Insert if new)
+        collection.replace_one(
+            {"message_id": msg_id},
+            document,
+            upsert=True
+        )
+        
+        # 2. Fetch and return the (new or existing) ID for downstream processing
+        updated_doc = collection.find_one({"message_id": msg_id}, {"_id": 1})
+        return {
+            "status": "success",
+            "id": str(updated_doc["_id"]),
+            "message_id": msg_id
+        }
     except Exception as e:
-        return f"Error storing email: {str(e)}"
+        print(f"MongoDB Store Error: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 @mcp.tool()
 def find_unclassified_by_semantic_group(query_embedding: list, limit: int = 5) -> str:
