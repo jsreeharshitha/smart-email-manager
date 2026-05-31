@@ -177,7 +177,7 @@ async def handle_new_mail(request: Request):
         
         # Track 2: Efficiency Trigger - Check unclassified count
         unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
-        if unclassified_count >= 25:
+        if unclassified_count >= 8:
             print(f"[*] Threshold Reached ({unclassified_count}). Running batch classification for {user_email}...")
             perform_batch_classification(user_email)
         
