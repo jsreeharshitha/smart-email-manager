@@ -273,9 +273,8 @@ def update_label_integrity(user_email: str, label_name: str):
 
 def perform_batch_classification(user_email: str):
     """
-    Track 2: Batch Classifier (Every 25th mail threshold).
-    Performs vector search logic across all unclassified mails against all existing label centroids.
-    Assigns the 'max label' that scores above 80%.
+    Track 2: AGGRESSIVE Batch Classifier (Every 8th mail threshold).
+    Always assigns best match, even if < 80%. Self-healing handles degradation.
     """
     try:
         label_collection = get_collection("LabelMetadata")
@@ -296,14 +295,14 @@ def perform_batch_classification(user_email: str):
         unclassified_id = get_sem_unclassified_id(user_email)
 
         match_count = 0
-        print(f"[*] Starting Batch Classification for {len(unclassified)} emails...")
+        print(f"[*] Starting AGGRESSIVE Batch Classification for {len(unclassified)} emails...")
 
         for email in unclassified:
             new_vec = np.array(email["vector_embedding"])
             best_match_label = None
-            highest_score = 0.0
+            highest_score = -1.0 # Force a match even if zero
 
-            # Find best centroid match
+            # Find best centroid match (Aggressive)
             for lbl in labels_meta:
                 centroid = np.array(lbl["centroid_vector"])
                 score = calculate_cosine_similarity(new_vec, centroid)
@@ -311,12 +310,12 @@ def perform_batch_classification(user_email: str):
                     highest_score = score
                     best_match_label = lbl["label_name"]
 
-            # Apply if > 80%
-            if highest_score >= 0.8 and best_match_label in label_map:
+            # Always apply the best match
+            if best_match_label in label_map:
                 label_id = label_map[best_match_label]
                 gmail_id = email.get("message_id")
                 
-                print(f"    [+] BATCH MATCH: Email {gmail_id} -> {best_match_label} ({highest_score:.2f})")
+                print(f"    [+] AGGRESSIVE MATCH: Email {gmail_id} -> {best_match_label} (Score: {highest_score:.2f})")
                 
                 # Update MongoDB
                 email_collection.update_one(
@@ -328,25 +327,25 @@ def perform_batch_classification(user_email: str):
                     apply_label_to_email(user_email, gmail_id, label_id)
                     if unclassified_id:
                         remove_label_from_email(user_email, gmail_id, unclassified_id)
+                    
+                    # Update label integrity (this will trigger reorg if score drops < 0.8)
+                    incremental_update_label_integrity(user_email, best_match_label, email["vector_embedding"])
                     match_count += 1
                 except: continue
         
-        return f"Batch classification complete. Categorized {match_count} emails."
+        return f"Aggressive batch classification complete. Categorized {match_count} emails."
 
     except Exception as e:
-        print(f"Batch Classification Error: {str(e)}")
+        print(f"Aggressive Batch Classification Error: {str(e)}")
         return f"Error: {str(e)}"
 
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
     Coordinates embedding generation and storage.
-    Automatically applies sem_unclassified label in Gmail.
+    Note: Classification handled by efficiency triggers in main.py.
     """
-    user_email = email_metadata.get("user_email")
-    gmail_id = email_metadata.get("message_id")
     embedding = generate_embedding(email_body)
 
-    # Initial document
     document = {
         **email_metadata,
         "vector_embedding": embedding,
@@ -361,6 +360,8 @@ def process_and_store_email(email_metadata: dict, email_body: str):
     
     # Tag with sem_unclassified in Gmail immediately
     try:
+        user_email = email_metadata.get("user_email")
+        gmail_id = email_metadata.get("message_id")
         unclassified_id = get_sem_unclassified_id(user_email)
         if unclassified_id:
             apply_label_to_email(user_email, gmail_id, unclassified_id)
@@ -376,7 +377,6 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
     """
     try:
         collection = get_collection()
-        # Fetch both Mongo _id and Gmail message_id
         query = {"user_email": user_email, "label": "unclassified"}
         emails = list(collection.find(query, {"_id": 1, "message_id": 1, "vector_embedding": 1, "subject": 1, "snippet": 1}))
 
@@ -390,11 +390,9 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
 
         clusters = []
         for i in range(n_clusters):
-            # Get ALL indices for this cluster
             cluster_indices = np.where(labels == i)[0]
             if len(cluster_indices) == 0: continue
             
-            # Find representatives (top 5 closest to centroid) for naming
             cluster_vectors = vectors[cluster_indices]
             distances = np.linalg.norm(cluster_vectors - centroids[i], axis=1)
             rep_indices = cluster_indices[np.argsort(distances)[:5]]
@@ -403,7 +401,6 @@ def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
             for idx in rep_indices:
                 reps.append({"id": str(emails[idx]["_id"]), "snippet": emails[idx].get("snippet", "")})
             
-            # Collect ALL IDs in this cluster for bulk labeling
             all_emails = []
             for idx in cluster_indices:
                 all_emails.append({
