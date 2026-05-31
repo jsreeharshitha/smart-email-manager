@@ -146,12 +146,16 @@ async def handle_new_mail(request: Request):
 
         try:
             history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
+            # COMMIT PROGRESS EARLY: Save the new history ID immediately to prevent loops on timeout
+            db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id, "updated_at": datetime.now(UTC).isoformat()}})
+            print(f"[*] History baseline updated to {new_history_id}. Processing batch...")
         except Exception as auth_err:
             if "expired" in str(auth_err).lower() or "401" in str(auth_err):
                 return {"status": "error", "message": "token_expired"}
             raise auth_err
         
         processed_count = 0
+        # Process the messages (The long loop)
         for change in history_res.get("history", []):
             for item in change.get("messagesAdded", []):
                 msg_id = item.get("message", {}).get("id")
@@ -164,24 +168,23 @@ async def handle_new_mail(request: Request):
                     }
                     process_and_store_email(metadata, msg_detail.get("snippet", ""))
                     processed_count += 1
+                    
+                    # Track 2: Efficiency Trigger - Check unclassified count
+                    # We do this inside the loop to clear the backlog as we go
+                    if processed_count % 25 == 0:
+                         perform_batch_classification(user_email)
+
                 except Exception as msg_err:
                     if "404" in str(msg_err):
-                        print(f"Skipping ghost message {msg_id}: Not found.")
                         continue
                     else:
                         print(f"Error processing message {msg_id}: {str(msg_err)}")
                         continue
 
-        # After processing, trigger reorg check
+        # Final cleanup classification and reorg check
         reorganize_mails(user_email)
+        perform_batch_classification(user_email)
         
-        # Track 2: Efficiency Trigger - Check unclassified count
-        unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
-        if unclassified_count >= 8:
-            print(f"[*] Threshold Reached ({unclassified_count}). Running batch classification for {user_email}...")
-            perform_batch_classification(user_email)
-        
-        db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
         return {"status": "success", "processed": processed_count}
     except Exception as e:
         print(f"ON-NEW-MAIL CRASH: {str(e)}")
