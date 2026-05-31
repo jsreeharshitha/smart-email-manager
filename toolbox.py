@@ -13,6 +13,7 @@ from vertexai.generative_models import GenerativeModel
 from google.cloud import pubsub_v1
 import random
 from bson import ObjectId
+import re
 
 # --- CORE BUSINESS LOGIC TOOLS ---
 
@@ -22,7 +23,6 @@ def generate_category_name(snippets: list) -> str:
     """
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
-        # Confirmed working settings: global location + gemini-3.5-flash
         vertexai.init(project=project_id, location="global")
         model = GenerativeModel("gemini-3.5-flash")
         
@@ -36,10 +36,7 @@ def generate_category_name(snippets: list) -> str:
         """
         
         response = model.generate_content(prompt)
-        # Cleanup response to ensure it's a valid label string
         name = response.text.strip().replace(" ", "-").lower()
-        # Remove any non-alphanumeric chars except dashes
-        import re
         name = re.sub(r'[^a-z0-9\-]', '', name)
         return name if name else "uncategorized"
     except Exception as e:
@@ -49,44 +46,47 @@ def generate_category_name(snippets: list) -> str:
 def reorganize_mails(user_email: str):
     """
     Workflow-Path-2 Orchestrator:
-    1. Detects degraded labels (< 80% integrity).
-    2. Resets emails to 'unclassified'.
-    3. Re-clusters and re-labels using AI (Gemini 3.5 Flash & 3.1 Pro).
+    1. Detects manual deletions in Gmail and syncs MongoDB.
+    2. Detects degraded labels (< 80% integrity).
+    3. Re-clusters and re-labels using Gemini 3.
     """
     try:
         project_id = os.getenv("PROJECT_ID", "grah-2026")
-        # Confirmed working settings: global location
         vertexai.init(project=project_id, location="global")
         
         email_collection = get_collection()
         label_collection = get_collection("LabelMetadata")
         
-        # 1. Identify Degraded Labels
+        # 1. Get Gmail State
+        gmail_labels = get_labels(user_email)
+        active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_")]
+        
+        # 2. Sync Guard: Detect labels in DB that are missing in Gmail (Manual Deletions)
+        db_labels = email_collection.distinct("label", {"user_email": user_email})
+        orphaned_labels = [l for l in db_labels if l.startswith("sem_") and l not in active_gmail_sem_labels]
+        
+        # 3. Identify Degraded Labels
         all_sem_meta = list(label_collection.find({"user_email": user_email}))
         degraded_labels = [l["label_name"] for l in all_sem_meta if l["semantic_integrity_score"] < 0.8]
         
-        # 2. Check Gmail for existing sem_ labels
-        gmail_labels = get_labels(user_email)
-        active_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_")]
-        
-        if not active_sem_labels or degraded_labels:
-            print(f"REORG TRIGGERED for {user_email}. Reason: {'No labels' if not active_sem_labels else 'Degraded labels: ' + str(degraded_labels)}")
-            
-            # 3. Shred Degraded Labels (Bulk Update)
-            if degraded_labels:
+        # Combine labels that need to be reset
+        labels_to_shred = list(set(orphaned_labels + degraded_labels))
+
+        if not active_gmail_sem_labels or labels_to_shred:
+            print(f"REORG TRIGGERED for {user_email}.")
+            if orphaned_labels: print(f"-> Reason: Orphaned labels found in DB: {orphaned_labels}")
+            if degraded_labels: print(f"-> Reason: Degraded labels: {degraded_labels}")
+            if not active_gmail_sem_labels: print(f"-> Reason: No sem_ labels in Gmail.")
+
+            # 4. Shred Labels (Bulk Update)
+            if labels_to_shred:
                 email_collection.update_many(
-                    {"user_email": user_email, "label": {"$in": degraded_labels}},
+                    {"user_email": user_email, "label": {"$in": labels_to_shred}},
                     {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
                 )
-                # Cleanup metadata and Gmail
-                for lbl in degraded_labels:
-                    label_collection.delete_one({"user_email": user_email, "label_name": lbl})
-                    label_id = next((l["id"] for l in gmail_labels if l["name"] == lbl), None)
-                    if label_id:
-                        delete_label(user_email, label_id)
+                label_collection.delete_many({"user_email": user_email, "label_name": {"$in": labels_to_shred}})
 
-            # 4. Perform New Clustering
-            # Dynamically adjust cluster count if we have few emails
+            # 5. Perform New Clustering
             email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
             target_clusters = 5
             if email_count < 5 and email_count >= 2:
@@ -99,44 +99,39 @@ def reorganize_mails(user_email: str):
                 return clusters
             
             for cluster in clusters:
-                # 5. Generate AI Name
+                # 6. Generate AI Name
                 snippets = [rep["snippet"] for rep in cluster["representatives"]]
                 raw_name = generate_category_name(snippets)
                 category_name = "sem_" + raw_name
                 
-                # 6. Create in Gmail (returns existing if already there)
+                # 7. Create in Gmail
                 new_label = create_label(user_email, category_name)
                 label_id = new_label.get("id")
                 
                 if not label_id:
-                    print(f"Failed to create/find label {category_name}. Skipping cluster.")
+                    print(f"Failed to create label {category_name}. Skipping cluster.")
                     continue
                 
-                # 7. Apply to ALL emails in this cluster
+                # 8. Apply to ALL emails
                 email_data_list = cluster["all_emails"]
-                print(f"Applying label {category_name} ({label_id}) to {len(email_data_list)} emails...")
-                
                 for item in email_data_list:
                     mongo_id = item["mongo_id"]
                     gmail_id = item["gmail_id"]
                     
-                    # Update MongoDB (Handle ObjectId conversion)
                     email_collection.update_one(
                         {"_id": ObjectId(mongo_id)}, 
                         {"$set": {"label": category_name}}
                     )
-                    # Update Gmail (Use correct Gmail Message ID)
                     try:
                         apply_label_to_email(user_email, gmail_id, label_id)
-                    except Exception as label_err:
-                        print(f"Error applying {category_name} to {gmail_id}: {str(label_err)}")
+                    except: continue
                 
-                # 8. Initialize/Update Metadata for the new label
+                # 9. Initialize Metadata
                 update_label_integrity(user_email, category_name)
                 
-            return "Reorganization complete. Inbox optimized."
+            return "Reorganization complete."
         
-        return "Inbox integrity is healthy (> 80%). No reorganization needed."
+        return "Inbox is healthy."
         
     except Exception as e:
         print(f"Reorg Error: {str(e)}")
