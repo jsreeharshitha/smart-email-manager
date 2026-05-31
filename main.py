@@ -20,7 +20,8 @@ from toolbox import (
     process_and_store_email, 
     cluster_unclassified_emails, 
     reorganize_mails, 
-    incremental_update_label_integrity
+    incremental_update_label_integrity,
+    perform_batch_classification
 )
 
 # --- 1. INITIALIZE FASTAPI ---
@@ -38,7 +39,8 @@ TOOLS = {
     "apply_label_to_email": apply_label_to_email,
     "get_emails_by_id": get_emails_by_id,
     "reorganize_mails": reorganize_mails,
-    "incremental_update_label_integrity": incremental_update_label_integrity
+    "incremental_update_label_integrity": incremental_update_label_integrity,
+    "perform_batch_classification": perform_batch_classification
 }
 
 
@@ -121,20 +123,25 @@ async def handle_new_mail(request: Request):
         
         user_session = db["UserSessions"].find_one({"user_email": user_email})
         if not user_session:
+            print(f"SESSION NOT FOUND for {user_email}. Auto-registering baseline.")
             db["UserSessions"].update_one(
                 {"user_email": user_email}, 
                 {"$set": {"last_history_id": new_history_id, "updated_at": datetime.now(UTC).isoformat()}}, 
                 upsert=True
             )
-            return {"status": "initialized"}
+            # PROACTIVE: Even on baseline setup, check if we need to organize existing data
+            reorganize_mails(user_email)
+            return {"status": "initialized_and_reorganized"}
 
         last_history_id = user_session.get("last_history_id")
         from tools.gmail_mcp import get_gmail_service
         gmail = get_gmail_service(user_email)
         
         if not last_history_id:
+            print(f"UPDATING BASELINE HISTORY for {user_email}")
             db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
-            return {"status": "initialized"}
+            reorganize_mails(user_email)
+            return {"status": "initialized_and_reorganized"}
 
         try:
             history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
@@ -156,6 +163,12 @@ async def handle_new_mail(request: Request):
                     }
                     process_and_store_email(metadata, msg_detail.get("snippet", ""))
                     processed_count += 1
+                    
+                    # Track 2 Trigger: Batch Classification every 10th email for efficiency
+                    if processed_count % 10 == 0:
+                        print(f"[*] Efficiency Trigger: Running batch classification for {user_email}...")
+                        perform_batch_classification(user_email)
+
                 except Exception as msg_err:
                     # Handle 404 specifically: message might have been deleted or moved manually
                     if "404" in str(msg_err):
@@ -167,7 +180,10 @@ async def handle_new_mail(request: Request):
 
         # After processing, trigger reorg check (e.g., if no sem_ labels exist yet)
         reorganize_mails(user_email)
-
+        
+        # Final cleanup classification for any remaining unclassified mail from this batch
+        if processed_count > 0:
+            perform_batch_classification(user_email)
         
         db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
         return {"status": "success", "processed": processed_count}

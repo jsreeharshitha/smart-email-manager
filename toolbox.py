@@ -261,66 +261,76 @@ def update_label_integrity(user_email: str, label_name: str):
         print(f"Integrity Calculation Error: {str(e)}")
         return f"Error: {str(e)}"
 
-def auto_classify_mail(user_email: str, gmail_id: str, mongo_id: ObjectId, embedding: list):
+def perform_batch_classification(user_email: str):
     """
-    Real-time Classifier: Compares new mail against existing healthy labels.
-    If similarity > 80%, classifies immediately.
+    Track 2: Batch Classifier (Every 10th mail efficiency).
+    Performs vector search logic across all unclassified mails against all existing label centroids.
+    Assigns the 'max label' that scores above 80%.
     """
     try:
         label_collection = get_collection("LabelMetadata")
         email_collection = get_collection()
         
-        # 1. Fetch all existing labels for this user
-        labels = list(label_collection.find({"user_email": user_email}))
-        if not labels:
-            return False
+        # 1. Fetch all unclassified emails
+        unclassified = list(email_collection.find({"user_email": user_email, "label": "unclassified"}))
+        if not unclassified:
+            return "No unclassified emails to process."
 
-        new_vec = np.array(embedding)
-        best_match = None
-        highest_score = 0.0
+        # 2. Fetch all label centroids
+        labels_meta = list(label_collection.find({"user_email": user_email}))
+        if not labels_meta:
+            return "No existing labels to match against."
 
-        # 2. Find the closest centroid
-        for lbl in labels:
-            centroid = np.array(lbl["centroid_vector"])
-            score = calculate_cosine_similarity(new_vec, centroid)
-            if score > highest_score:
-                highest_score = score
-                best_match = lbl["label_name"]
+        gmail_labels = get_labels(user_email)
+        label_map = {l["name"]: l["id"] for l in gmail_labels if l["name"].startswith("sem_")}
 
-        # 3. Apply if above 80% threshold
-        if highest_score >= 0.8:
-            print(f"REAL-TIME MATCH: Email matched '{best_match}' with {highest_score:.2f} similarity.")
-            
-            # Update MongoDB
-            email_collection.update_one(
-                {"_id": mongo_id},
-                {"$set": {"label": best_match, "email_semantic_score": float(highest_score)}}
-            )
-            
-            # Update Gmail
-            gmail_labels = get_labels(user_email)
-            label_id = next((l["id"] for l in gmail_labels if l["name"] == best_match), None)
-            if label_id:
-                apply_label_to_email(user_email, gmail_id, label_id)
-                # 4. Trigger incremental update to keep centroid healthy
-                incremental_update_label_integrity(user_email, best_match, embedding)
-                return True
+        match_count = 0
+        print(f"[*] Starting Batch Classification for {len(unclassified)} emails...")
+
+        for email in unclassified:
+            new_vec = np.array(email["vector_embedding"])
+            best_match_label = None
+            highest_score = 0.0
+
+            # Find best centroid match
+            for lbl in labels_meta:
+                centroid = np.array(lbl["centroid_vector"])
+                score = calculate_cosine_similarity(new_vec, centroid)
+                if score > highest_score:
+                    highest_score = score
+                    best_match_label = lbl["label_name"]
+
+            # Apply if > 80%
+            if highest_score >= 0.8 and best_match_label in label_map:
+                label_id = label_map[best_match_label]
+                gmail_id = email.get("message_id")
                 
-        return False
+                print(f"    [+] BATCH MATCH: Email {gmail_id} -> {best_match_label} ({highest_score:.2f})")
+                
+                # Update MongoDB
+                email_collection.update_one(
+                    {"_id": email["_id"]},
+                    {"$set": {"label": best_match_label, "email_semantic_score": float(highest_score)}}
+                )
+                # Update Gmail
+                try:
+                    apply_label_to_email(user_email, gmail_id, label_id)
+                    match_count += 1
+                except: continue
+        
+        return f"Batch classification complete. Categorized {match_count} emails."
+
     except Exception as e:
-        print(f"Auto-Classification Error: {str(e)}")
-        return False
+        print(f"Batch Classification Error: {str(e)}")
+        return f"Error: {str(e)}"
 
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
     Coordinates embedding generation and storage.
-    Now includes real-time classification attempt.
+    Note: Real-time classification is now handled in batches by perform_batch_classification.
     """
-    user_email = email_metadata.get("user_email")
-    gmail_id = email_metadata.get("message_id")
     embedding = generate_embedding(email_body)
 
-    # Initial document
     document = {
         **email_metadata,
         "vector_embedding": embedding,
@@ -330,15 +340,8 @@ def process_and_store_email(email_metadata: dict, email_body: str):
         "snippet": email_body[:200]
     }
 
-    # Save to MongoDB first
-    res = store_email_record(document)
-    mongo_id = ObjectId(res.get("id")) if isinstance(res, dict) else None
-
-    # Attempt Real-time Classification
-    if mongo_id:
-        auto_classify_mail(user_email, gmail_id, mongo_id, embedding)
-
-    return res
+    # Save to MongoDB
+    return store_email_record(document)
 
 def cluster_unclassified_emails(user_email: str, n_clusters: int = 5):
     """
