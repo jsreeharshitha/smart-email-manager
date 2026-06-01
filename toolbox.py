@@ -18,8 +18,33 @@ import re
 # --- CORE BUSINESS LOGIC TOOLS ---
 
 UNCLASSIFIED_LABEL = "sem_unclassified"
-MAX_SEMANTIC_LABELS = 5
-REORG_COOLDOWN_HOURS = 1
+
+DEFAULT_CONFIG = {
+    "MAX_SEMANTIC_LABELS": 5,
+    "REORG_COOLDOWN_HOURS": 1,
+    "BACKLOG_THRESHOLD": 15,
+    "DEFAULT_SIMILARITY_THRESHOLD": 0.85,
+    "ADAPTIVE_THRESHOLD_HYSTERESIS": 0.85,
+    "BATCH_CLASSIFICATION_FREQUENCY": 10,
+    "AUTO_SYNC_NEW_EMAILS": True
+}
+
+def get_user_settings(user_email: str) -> dict:
+    """
+    Fetches user-specific agent configurations from MongoDB.
+    Ensures the agent behavior can be tuned via the UI without code changes.
+    """
+    try:
+        client = get_client()
+        db = client[settings.DB_NAME]
+        user_session = db["UserSessions"].find_one({"user_email": user_email})
+        
+        user_settings = user_session.get("agent_settings", {}) if user_session else {}
+        # Merge defaults with user-specific overrides
+        return {**DEFAULT_CONFIG, **user_settings}
+    except Exception as e:
+        print(f"Error fetching user settings: {str(e)}")
+        return DEFAULT_CONFIG
 
 def get_sem_unclassified_id(user_email: str) -> str:
     """Helper to get or create the sem_unclassified label ID."""
@@ -56,10 +81,13 @@ def reorganize_mails(user_email: str):
     """
     Workflow-Path-2 Orchestrator (Stable Fallback):
     1. Cooldown Guard: Prevents infinite reorg loops.
-    2. Backlog Threshold: Only triggers if unclassified pile is significant (>15).
+    2. Backlog Threshold: Only triggers if unclassified pile is significant.
     3. Adaptive Thresholds: Sets a realistic bar for each label.
     """
     try:
+        # Load Dynamic Settings
+        config = get_user_settings(user_email)
+        
         client = get_client()
         db = client[settings.DB_NAME]
         email_collection = db["EmailData"]
@@ -70,13 +98,12 @@ def reorganize_mails(user_email: str):
         session = session_collection.find_one({"user_email": user_email})
         if session and "last_reorganized_at" in session:
             last_reorg = datetime.fromisoformat(session["last_reorganized_at"])
-            if datetime.now(UTC) - last_reorg < timedelta(hours=REORG_COOLDOWN_HOURS):
+            if datetime.now(UTC) - last_reorg < timedelta(hours=config["REORG_COOLDOWN_HOURS"]):
                 print(f"[*] REORG COOLDOWN ACTIVE for {user_email}. Skipping reorganization.")
                 return "Cooldown active. Skipping reorg."
 
         # --- 2. BACKLOG THRESHOLD ---
         # Only reorganize if we have a significant number of unclassified emails.
-        # This prevents the system from shredding labels for just 1-2 unique emails.
         unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
         
         project_id = os.getenv("PROJECT_ID", "grah-2026")
@@ -98,7 +125,7 @@ def reorganize_mails(user_email: str):
         labels_to_shred = list(set(orphaned_labels + degraded_labels))
 
         # TRIGGER CONDITION: Heavy backlog OR degraded/orphaned labels OR system starting fresh
-        if unclassified_count > 15 or labels_to_shred or not active_gmail_sem_labels or len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
+        if unclassified_count > config["BACKLOG_THRESHOLD"] or labels_to_shred or not active_gmail_sem_labels or len(active_gmail_sem_labels) > config["MAX_SEMANTIC_LABELS"]:
             print(f"[*] REORG STARTING for {user_email} (Backlog: {unclassified_count})...")
 
             if labels_to_shred:
@@ -108,14 +135,14 @@ def reorganize_mails(user_email: str):
                 )
                 label_collection.delete_many({"user_email": user_email, "label_name": {"$in": labels_to_shred}})
                 
-                if len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
+                if len(active_gmail_sem_labels) > config["MAX_SEMANTIC_LABELS"]:
                     for l_name in active_gmail_sem_labels:
                         l_id = next((l["id"] for l in gmail_labels if l["name"] == l_name), None)
                         if l_id: delete_label(user_email, l_id)
 
-            # 3. Clustering (Capped at 5)
+            # 3. Clustering (Capped at MAX_SEMANTIC_LABELS)
             email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
-            target_clusters = min(MAX_SEMANTIC_LABELS, max(2, email_count // 5 if email_count < 25 else 5))
+            target_clusters = min(config["MAX_SEMANTIC_LABELS"], max(2, email_count // 5 if email_count < 25 else config["MAX_SEMANTIC_LABELS"]))
             
             clusters = cluster_unclassified_emails(user_email, n_clusters=target_clusters)
             if isinstance(clusters, str): return clusters
@@ -143,13 +170,12 @@ def reorganize_mails(user_email: str):
                     except: continue
                 
                 # 7. ADAPTIVE THRESHOLD SETTING
-                # We calculate the starting integrity and set the threshold at 85% of that.
-                # This ensures we don't spiral if the data is naturally messy.
+                # We calculate the starting integrity and set the threshold at a hysteresis % of that.
                 meta_res = update_label_integrity(user_email, category_name)
                 if isinstance(meta_res, dict):
                     achieved_score = meta_res["integrity_score"]
                     # Hysteresis: The bar is set lower than what we just achieved
-                    adaptive_threshold = max(0.6, achieved_score * 0.85)
+                    adaptive_threshold = max(0.6, achieved_score * config["ADAPTIVE_THRESHOLD_HYSTERESIS"])
                     label_collection.update_one(
                         {"user_email": user_email, "label_name": category_name},
                         {"$set": {"threshold_score": adaptive_threshold}}
@@ -289,6 +315,9 @@ def perform_batch_classification(user_email: str):
     Prioritizes existing labels and uses a high-confidence Stability Gate.
     """
     try:
+        # Load Dynamic Settings
+        config = get_user_settings(user_email)
+        
         label_collection = get_collection("LabelMetadata")
         email_collection = get_collection()
         
@@ -319,7 +348,7 @@ def perform_batch_classification(user_email: str):
             new_vec = np.array(email["vector_embedding"])
             best_match_label = None
             highest_score = -1.0
-            target_threshold = 0.85 # Default fallback
+            target_threshold = config["DEFAULT_SIMILARITY_THRESHOLD"]
 
             for lbl in labels_meta:
                 centroid = np.array(lbl["centroid_vector"])
@@ -327,10 +356,9 @@ def perform_batch_classification(user_email: str):
                 if score > highest_score:
                     highest_score = score
                     best_match_label = lbl["label_name"]
-                    target_threshold = lbl.get("threshold_score", 0.85)
+                    target_threshold = lbl.get("threshold_score", config["DEFAULT_SIMILARITY_THRESHOLD"])
 
-            # 3. ADAPTIVE STABILITY GATE: Use the label's specific threshold_score
-            # This ensures we respect the unique "tightness" of each category.
+            # 3. ADAPTIVE STABILITY GATE: Use the label's specific threshold_score or system default
             if highest_score > target_threshold and best_match_label in active_label_map:
                 label_id = active_label_map[best_match_label]
                 gmail_id = email.get("message_id")

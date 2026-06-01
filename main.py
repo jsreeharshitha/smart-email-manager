@@ -114,6 +114,14 @@ async def handle_new_mail(request: Request):
         
         print(f"NOTIFICATION RECEIVED: {user_email} (History: {new_history_id})")
 
+        # Load dynamic settings
+        from toolbox import get_user_settings
+        config = get_user_settings(user_email)
+        
+        if not config.get("AUTO_SYNC_NEW_EMAILS", True):
+            print(f"[*] AUTO-SYNC DISABLED for {user_email}. Skipping notification processing.")
+            return {"status": "skipped", "message": "Auto-sync disabled in settings."}
+
         # Check MONGO_URI
         if "agent.run.app" in settings.MONGO_URI or "localhost" in settings.MONGO_URI:
             print("CRITICAL ERROR: MONGO_URI is still pointing to a placeholder!")
@@ -155,6 +163,8 @@ async def handle_new_mail(request: Request):
             raise auth_err
         
         processed_count = 0
+        batch_freq = config.get("BATCH_CLASSIFICATION_FREQUENCY", 10)
+        
         # Process the messages (The long loop)
         for change in history_res.get("history", []):
             for item in change.get("messagesAdded", []):
@@ -170,7 +180,7 @@ async def handle_new_mail(request: Request):
                     processed_count += 1
                     
                     # Track 3: Stable Classification - Check frequently to clear backlog
-                    if processed_count % 10 == 0:
+                    if processed_count % batch_freq == 0:
                          perform_batch_classification(user_email)
 
                 except Exception as msg_err:
@@ -219,6 +229,63 @@ async def sync_credentials(request: Request):
         return {"status": "success", "message": "Persistent credentials synchronized!"}
     except Exception as e:
         print(f"Sync Error: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/settings")
+async def get_settings(user_email: str):
+    """Retrieves user-specific agent settings."""
+    try:
+        return get_user_settings(user_email)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/settings")
+async def update_settings(request: Request):
+    """Updates user-specific agent settings in MongoDB."""
+    try:
+        data = await request.json()
+        user_email = data.get("user_email")
+        new_settings = data.get("settings")
+        
+        if not user_email or new_settings is None:
+            raise HTTPException(status_code=400, detail="user_email and settings are required.")
+            
+        client = get_client()
+        db = client["smart_email_manager"]
+        db["UserSessions"].update_one(
+            {"user_email": user_email},
+            {"$set": {
+                "agent_settings": new_settings,
+                "updated_at": datetime.now(UTC).isoformat()
+            }},
+            upsert=True
+        )
+        return {"status": "success", "message": "Settings updated successfully."}
+    except Exception as e:
+        print(f"Settings Update Error: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/sync-historical")
+async def sync_historical(request: Request):
+    """
+    Triggers a manual sync of historical emails for a specific time range.
+    """
+    try:
+        data = await request.json()
+        user_email = data.get("user_email")
+        lookback_days = data.get("lookback_days", 30)
+        
+        # This is a stub for a long-running task. 
+        # In a production app, this should be an async background task.
+        print(f"[*] MANUAL HISTORICAL SYNC STARTING for {user_email} (Lookback: {lookback_days} days)")
+        
+        # Trigger an immediate reorg and batch classification to clear backlog
+        reorganize_mails(user_email)
+        perform_batch_classification(user_email)
+        
+        return {"status": "success", "message": f"Historical sync for last {lookback_days} days triggered!"}
+    except Exception as e:
+        print(f"Historical Sync Error: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/api/verify-system")
