@@ -13,8 +13,9 @@ mcp = FastMCP("GmailSuite")
 
 # Required Scopes
 SCOPES = [
-    'https://www.googleapis.com/auth/gmail.labels',
+    'https://www.googleapis.com/auth/cloud-platform',
     'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/gmail.labels',
     'https://www.googleapis.com/auth/gmail.readonly'
 ]
 
@@ -34,13 +35,14 @@ def get_gmail_service(user_email: str):
         creds_data = user_session["credentials"]
         
         # Initialize Credentials with ALL available fields to allow automatic refresh
+        # NOTE: We omit the 'scopes' parameter here to allow the refresh_token to 
+        # use whatever scopes were originally authorized without causing a mismatch error.
         creds = Credentials(
             token=creds_data.get('access_token'),
             refresh_token=creds_data.get('refresh_token'),
             token_uri=creds_data.get('token_uri', "https://oauth2.googleapis.com/token"),
             client_id=creds_data.get('client_id'),
-            client_secret=creds_data.get('client_secret'),
-            scopes=SCOPES
+            client_secret=creds_data.get('client_secret')
         )
 
         # Proactive Refresh if expired

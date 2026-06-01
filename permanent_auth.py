@@ -11,7 +11,9 @@ def run_sync():
     # These scopes match the requirements for Gmail and general GCP management
     SCOPES = [
         'https://www.googleapis.com/auth/cloud-platform',
-        'https://www.googleapis.com/auth/gmail.modify'
+        'https://www.googleapis.com/auth/gmail.modify',
+        'https://www.googleapis.com/auth/gmail.labels',
+        'https://www.googleapis.com/auth/gmail.readonly'
     ]
     
     # Discovery logic to find existing setup
