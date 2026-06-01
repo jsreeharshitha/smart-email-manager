@@ -169,9 +169,8 @@ async def handle_new_mail(request: Request):
                     process_and_store_email(metadata, msg_detail.get("snippet", ""))
                     processed_count += 1
                     
-                    # Track 2: Efficiency Trigger - Check unclassified count
-                    # We do this inside the loop to clear the backlog as we go
-                    if processed_count % 25 == 0:
+                    # Track 3: Stable Classification - Check frequently to clear backlog
+                    if processed_count % 10 == 0:
                          perform_batch_classification(user_email)
 
                 except Exception as msg_err:
@@ -181,9 +180,11 @@ async def handle_new_mail(request: Request):
                         print(f"Error processing message {msg_id}: {str(msg_err)}")
                         continue
 
-        # Final cleanup classification and reorg check
-        reorganize_mails(user_email)
+        # Final cleanup classification and stable reorg check
+        # perform_batch_classification handles existing labels (Stability)
+        # reorganize_mails handles discovery/backlog (Flexibility)
         perform_batch_classification(user_email)
+        reorganize_mails(user_email)
         
         return {"status": "success", "processed": processed_count}
     except Exception as e:

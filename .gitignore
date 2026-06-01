@@ -11,3 +11,4 @@ dist/
 .idea/
 credentials.json
 token.json
+client-secret.json

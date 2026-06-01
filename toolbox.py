@@ -54,9 +54,10 @@ def generate_category_name(snippets: list) -> str:
 
 def reorganize_mails(user_email: str):
     """
-    Workflow-Path-2 Orchestrator (Disciplined):
+    Workflow-Path-2 Orchestrator (Stable Fallback):
     1. Cooldown Guard: Prevents infinite reorg loops.
-    2. Adaptive Thresholds: Sets a realistic bar for each label.
+    2. Backlog Threshold: Only triggers if unclassified pile is significant (>15).
+    3. Adaptive Thresholds: Sets a realistic bar for each label.
     """
     try:
         client = get_client()
@@ -73,10 +74,15 @@ def reorganize_mails(user_email: str):
                 print(f"[*] REORG COOLDOWN ACTIVE for {user_email}. Skipping reorganization.")
                 return "Cooldown active. Skipping reorg."
 
+        # --- 2. BACKLOG THRESHOLD ---
+        # Only reorganize if we have a significant number of unclassified emails.
+        # This prevents the system from shredding labels for just 1-2 unique emails.
+        unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
+        
         project_id = os.getenv("PROJECT_ID", "grah-2026")
         vertexai.init(project=project_id, location="global")
         
-        # 2. Get Current State
+        # 3. Get Current State
         gmail_labels = get_labels(user_email)
         active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_") and l["name"] != UNCLASSIFIED_LABEL]
         unclassified_id = get_sem_unclassified_id(user_email)
@@ -91,8 +97,9 @@ def reorganize_mails(user_email: str):
         
         labels_to_shred = list(set(orphaned_labels + degraded_labels))
 
-        if not active_gmail_sem_labels or labels_to_shred or len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
-            print(f"[*] REORG STARTING for {user_email}...")
+        # TRIGGER CONDITION: Heavy backlog OR degraded/orphaned labels OR system starting fresh
+        if unclassified_count > 15 or labels_to_shred or not active_gmail_sem_labels or len(active_gmail_sem_labels) > MAX_SEMANTIC_LABELS:
+            print(f"[*] REORG STARTING for {user_email} (Backlog: {unclassified_count})...")
 
             if labels_to_shred:
                 email_collection.update_many(
@@ -278,7 +285,8 @@ def update_label_integrity(user_email: str, label_name: str):
 
 def perform_batch_classification(user_email: str):
     """
-    Track 2: AGGRESSIVE Batch Classifier.
+    Track 3: STABLE Batch Classifier.
+    Prioritizes existing labels and uses a high-confidence Stability Gate.
     """
     try:
         label_collection = get_collection("LabelMetadata")
@@ -288,19 +296,30 @@ def perform_batch_classification(user_email: str):
         if not unclassified:
             return "No unclassified emails to process."
 
-        labels_meta = list(label_collection.find({"user_email": user_email}))
-        if not labels_meta:
-            return "No existing labels to match against."
-
+        # 1. Sync with Gmail: Only match against labels that currently EXIST in the sidebar
         gmail_labels = get_labels(user_email)
-        label_map = {l["name"]: l["id"] for l in gmail_labels if l["name"].startswith("sem_")}
-        unclassified_id = get_sem_unclassified_id(user_email)
+        active_label_map = {l["name"]: l["id"] for l in gmail_labels if l["name"].startswith("sem_")}
+        
+        if not active_label_map:
+            return "No active sem_ labels found in Gmail. Waiting for reorganization."
 
+        # 2. Get metadata ONLY for these active labels
+        labels_meta = list(label_collection.find({
+            "user_email": user_email, 
+            "label_name": {"$in": list(active_label_map.keys())}
+        }))
+
+        if not labels_meta:
+            return "No metadata found for active labels."
+
+        unclassified_id = get_sem_unclassified_id(user_email)
         match_count = 0
+        
         for email in unclassified:
             new_vec = np.array(email["vector_embedding"])
             best_match_label = None
             highest_score = -1.0
+            target_threshold = 0.85 # Default fallback
 
             for lbl in labels_meta:
                 centroid = np.array(lbl["centroid_vector"])
@@ -308,9 +327,12 @@ def perform_batch_classification(user_email: str):
                 if score > highest_score:
                     highest_score = score
                     best_match_label = lbl["label_name"]
+                    target_threshold = lbl.get("threshold_score", 0.85)
 
-            if best_match_label in label_map:
-                label_id = label_map[best_match_label]
+            # 3. ADAPTIVE STABILITY GATE: Use the label's specific threshold_score
+            # This ensures we respect the unique "tightness" of each category.
+            if highest_score > target_threshold and best_match_label in active_label_map:
+                label_id = active_label_map[best_match_label]
                 gmail_id = email.get("message_id")
                 
                 email_collection.update_one(
@@ -325,10 +347,10 @@ def perform_batch_classification(user_email: str):
                     match_count += 1
                 except: continue
         
-        return f"Batch classification complete. Categorized {match_count} emails."
+        return f"Stable classification complete. Categorized {match_count} emails."
 
     except Exception as e:
-        print(f"Aggressive Batch Classification Error: {str(e)}")
+        print(f"Stable Batch Classification Error: {str(e)}")
         return f"Error: {str(e)}"
 
 def process_and_store_email(email_metadata: dict, email_body: str):

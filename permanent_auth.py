@@ -63,7 +63,9 @@ def run_sync():
                 "access_token": creds.token,
                 "refresh_token": creds.refresh_token,
                 "client_id": creds.client_id,
-                "client_secret": creds.client_secret
+                "client_secret": creds.client_secret,
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "expiry": creds.expiry.isoformat() if creds.expiry else None
             }
         }
 

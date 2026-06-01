@@ -21,7 +21,7 @@ SCOPES = [
 def get_gmail_service(user_email: str):
     """
     Authenticates and returns the Gmail API service instance.
-    Manually handles refreshes to avoid library-level crashes.
+    Ensures the credentials object has refresh capabilities to prevent library-level crashes.
     """
     try:
         client = get_client()
@@ -32,36 +32,33 @@ def get_gmail_service(user_email: str):
             raise Exception("No credentials found in MongoDB.")
 
         creds_data = user_session["credentials"]
-        access_token = creds_data.get('access_token')
-        refresh_token = creds_data.get('refresh_token')
+        
+        # Initialize Credentials with ALL available fields to allow automatic refresh
+        creds = Credentials(
+            token=creds_data.get('access_token'),
+            refresh_token=creds_data.get('refresh_token'),
+            token_uri=creds_data.get('token_uri', "https://oauth2.googleapis.com/token"),
+            client_id=creds_data.get('client_id'),
+            client_secret=creds_data.get('client_secret'),
+            scopes=SCOPES
+        )
 
-        # 1. Create a credentials object with ONLY the access token initially
-        creds = Credentials(token=access_token)
-
-        # 2. Manual Expiry Check & Refresh
-        if creds.expired:
-            if refresh_token and creds_data.get('client_id'):
-                print(f"Token expired for {user_email}. Attempting IMMORTAL refresh...")
-                try:
-                    refresh_creds = Credentials(
-                        token=None,
-                        refresh_token=refresh_token,
-                        token_uri="https://oauth2.googleapis.com/token",
-                        client_id=creds_data.get('client_id'),
-                        client_secret=creds_data.get('client_secret')
-                    )
-                    refresh_creds.refresh(Request())
-                    
-                    db["UserSessions"].update_one(
-                        {"user_email": user_email},
-                        {"$set": {"credentials.access_token": refresh_creds.token}}
-                    )
-                    creds = Credentials(token=refresh_creds.token)
-                    print("Immortal refresh successful.")
-                except Exception as re_err:
-                    print(f"Immortal Refresh Failed: {str(re_err)}")
-            else:
-                print(f"Token expired for {user_email} and no refresh keys found. Operating in short-lived mode.")
+        # Proactive Refresh if expired
+        if creds.expired or (creds.refresh_token and not creds.valid):
+            print(f"[*] Token expired or invalid for {user_email}. Refreshing...")
+            try:
+                creds.refresh(Request())
+                # Update DB with new token
+                db["UserSessions"].update_one(
+                    {"user_email": user_email},
+                    {"$set": {
+                        "credentials.access_token": creds.token,
+                        "credentials.expiry": creds.expiry.isoformat() if creds.expiry else None
+                    }}
+                )
+                print("[+] Token refreshed and saved to DB.")
+            except Exception as re_err:
+                print(f"[!] Proactive Refresh Failed: {str(re_err)}. Continuing with existing token...")
         
         return build('gmail', 'v1', credentials=creds)
 
