@@ -21,7 +21,8 @@ from toolbox import (
     cluster_unclassified_emails, 
     reorganize_mails, 
     incremental_update_label_integrity,
-    perform_batch_classification
+    perform_batch_classification,
+    get_user_settings
 )
 
 # --- 1. INITIALIZE FASTAPI ---
@@ -241,7 +242,7 @@ async def get_settings(user_email: str):
 
 @app.post("/api/settings")
 async def update_settings(request: Request):
-    """Updates user-specific agent settings in MongoDB."""
+    """Updates user-specific agent settings in MongoDB with partial merge support."""
     try:
         data = await request.json()
         user_email = data.get("user_email")
@@ -252,12 +253,16 @@ async def update_settings(request: Request):
             
         client = get_client()
         db = client["smart_email_manager"]
+        
+        # Construct MongoDB dot notation for merging partial updates
+        update_fields = {"updated_at": datetime.now(UTC).isoformat()}
+        if isinstance(new_settings, dict):
+            for key, value in new_settings.items():
+                update_fields[f"agent_settings.{key}"] = value
+                
         db["UserSessions"].update_one(
             {"user_email": user_email},
-            {"$set": {
-                "agent_settings": new_settings,
-                "updated_at": datetime.now(UTC).isoformat()
-            }},
+            {"$set": update_fields},
             upsert=True
         )
         return {"status": "success", "message": "Settings updated successfully."}
