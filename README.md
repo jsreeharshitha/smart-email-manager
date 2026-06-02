@@ -23,67 +23,80 @@ Built for the **Google Rapid Agent Hackathon**, this agent leverages the Model C
 3.  **Intelligent Email Grouping:** Group unclassified emails that share similar semantic themes for batch processing.
 4.  **Customer Support Triage:** Automatically tag support emails by topic (e.g., "billing", "technical-issue", "feature-request").
 
-## Quickstart
+## Screenshots
 
-### Prerequisites
+| Dashboard | Components |
+| :---: | :---: |
+| ![Smart Email Manager](screenshot/smart-email-manager.png) | ![Components](screenshot/smart-email-manager-components.png) |
 
-- Python 3.11+
-- A Google Cloud Project with Gmail API enabled.
-- A MongoDB Atlas Cluster (Free tier works great).
-- Google Cloud SDK (`gcloud`) installed and configured.
+## Setup & Deployment Guide (Local & Cloud)
 
-### Local Setup
+This guide provides the comprehensive path to deploy the Smart Email Manager stack.
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/jsreeharshitha/smart-email-manager.git
-    cd smart-email-manager
-    ```
+### Step 0: Prerequisites
 
-2.  **Install dependencies:**
+Before you begin, ensure you have the following accounts and keys:
+
+1.  **MongoDB Atlas**:
+    - Create a free account at [mongodb.com/atlas](https://www.mongodb.com/cloud/atlas/register).
+    - **Create a Project** and a **Cluster** (Shared/Free Tier).
+    - **Database Access**: Create a user with **"Read and write to any database"** permissions.
+    - **Network Access**: Add **`0.0.0.0/0`** (Allow Access from Anywhere) for development.
+    - **Connect**: Copy your **Connection String (MONGO_URI)**.
+
+2.  **Voyage AI**:
+    - Sign up at [voyageai.com](https://www.voyageai.com/).
+    - Go to **API Keys** and copy your **API Key**.
+
+### Step 1: Initialize Environment
+
+1.  **Install dependencies:**
     ```bash
     pip install -r requirements.txt
     ```
 
-3.  **Configure Environment Variables:**
-    Create a `.env` file (or set them in your environment):
+2.  **Configure Environment Variables:**
+    Create a `.env` file or set them in your environment:
     ```env
     MONGO_URI=your_mongodb_atlas_connection_string
     VOYAGE_API_KEY=your_voyage_ai_api_key
     ```
 
-4.  **Google API Setup:**
-    - Place your `credentials.json` (OAuth 2.0 Client ID) from the Google Cloud Console in the root directory.
-    - Run the agent for the first time to complete the OAuth flow:
+3.  **Google API Setup:**
+    - Place your `credentials.json` (OAuth 2.0 Client ID) in the root directory.
+    - Run the agent to complete the OAuth flow:
       ```bash
       python tools/gmail_mcp.py
       ```
-    - This will generate a `token.json` file for subsequent runs.
 
-5.  **Initialize Vector Index:**
+### Step 2: Provision Identity & Permissions (GCP)
+
+If deploying to Google Cloud, follow these steps:
+
+1.  **Grant Deployment Roles**:
     ```bash
-    python tools/setup_vector_index.py
+    PROJECT_ID=$(gcloud config get-value project)
+    USER_EMAIL=$(gcloud config get-value account)
+
+    gcloud projects add-iam-policy-binding $PROJECT_ID --member="user:$USER_EMAIL" --role="roles/run.admin"
+    gcloud projects add-iam-policy-binding $PROJECT_ID --member="user:$USER_EMAIL" --role="roles/discoveryengine.admin"
+    gcloud projects add-iam-policy-binding $PROJECT_ID --member="user:$USER_EMAIL" --role="roles/pubsub.admin"
+    gcloud projects add-iam-policy-binding $PROJECT_ID --member="user:$USER_EMAIL" --role="roles/aiplatform.user"
     ```
 
-6.  **Run the Agent:**
+### Step 3: Deploy Backend (Cloud Run)
+
+1.  **Build and Push Container**:
     ```bash
-    python main.py
+    gcloud builds submit --tag gcr.io/$PROJECT_ID/smart-email-manager-agent .
     ```
 
-### Deployment (Cloud Run)
-
-Use the provided scripts to deploy to Google Cloud Run:
-
-**Linux/macOS:**
-```bash
-chmod +x deploy/deploy.sh
-./deploy/deploy.sh
-```
-
-**Windows (PowerShell):**
-```powershell
-.\deploy\deploy.ps1
-```
+2.  **Launch Service**:
+    ```bash
+    gcloud run deploy smart-email-manager-agent \
+      --image gcr.io/$PROJECT_ID/smart-email-manager-agent \
+      --platform managed --region us-central1 --allow-unauthenticated --port 8080
+    ```
 
 ## Architecture
 
