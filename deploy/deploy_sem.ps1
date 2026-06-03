@@ -1,7 +1,7 @@
 # Master Deployment Script: Smart Email Manager Stack
 # --------------------------------------------------
 $PROJECT_ID = "grah-2026"
-$REGION = "us-central1"
+$REGION = if ($env:CHOSEN_REGION) { $env:CHOSEN_REGION } else { "us-central1" }
 $IMAGE = "$REGION-docker.pkg.dev/$PROJECT_ID/agent-repo/smart-email-manager-agent:latest"
 
 # 0. Load Secrets from .env (located in project root)
