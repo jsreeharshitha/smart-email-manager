@@ -163,6 +163,8 @@ def reorganize_mails(user_email: str):
                 for item in email_data_list:
                     mongo_id = item["mongo_id"]
                     gmail_id = item["gmail_id"]
+                    # DATA PRESERVATION: Only update the label. 
+                    # thread_id and sent_at are preserved for Inbox-Analytics.
                     email_collection.update_one({"_id": ObjectId(mongo_id)}, {"$set": {"label": category_name}})
                     try:
                         apply_label_to_email(user_email, gmail_id, label_id)
@@ -384,6 +386,7 @@ def perform_batch_classification(user_email: str):
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
     Coordinates embedding generation and storage.
+    Now supports enriched metadata (thread_id, sent_at) for analytics.
     """
     embedding = generate_embedding(email_body)
 

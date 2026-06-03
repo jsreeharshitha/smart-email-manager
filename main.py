@@ -172,9 +172,18 @@ async def handle_new_mail(request: Request):
                 msg_id = item.get("message", {}).get("id")
                 try:
                     msg_detail = gmail.users().messages().get(userId="me", id=msg_id).execute()
+                    
+                    # Extract new fields for analytics
+                    thread_id = msg_detail.get("threadId")
+                    # internalDate is in milliseconds, convert to ISO for BigQuery
+                    sent_at_ms = int(msg_detail.get("internalDate", 0))
+                    sent_at_iso = datetime.fromtimestamp(sent_at_ms / 1000.0, UTC).isoformat()
+
                     metadata = {
                         "subject": msg_detail.get("snippet", "New Mail"), 
                         "message_id": msg_id, 
+                        "thread_id": thread_id,
+                        "sent_at": sent_at_iso,
                         "user_email": user_email
                     }
                     process_and_store_email(metadata, msg_detail.get("snippet", ""))
