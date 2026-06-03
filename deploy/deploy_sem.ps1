@@ -1,16 +1,23 @@
 # Master Deployment Script: Smart Email Manager Stack
 # --------------------------------------------------
-$PROJECT_ID = "grah-2026"
+$PROJECT_ID = gcloud config get-value project
 $REGION = if ($env:CHOSEN_REGION) { $env:CHOSEN_REGION } else { "us-central1" }
 $IMAGE = "$REGION-docker.pkg.dev/$PROJECT_ID/agent-repo/smart-email-manager-agent:latest"
 
-# 0. Load Secrets from .env (located in project root)
-$envFile = "../../../.env"
-if (Test-Path $envFile) {
-    Write-Host "[*] Loading environment variables from .env..."
-    Get-Content $envFile | ForEach-Object {
-        if ($_ -match "^(?<name>[^=]+)=(?<value>.*)$") {
-            Set-Item -Path "env:$($Matches['name'])" -Value $Matches['value']
+# 0. Load Secrets from .env (CASCADING: submodule -> super-repo root)
+$envPaths = @("../.env", "../../../.env")
+foreach ($path in $envPaths) {
+    if (Test-Path $path) {
+        Write-Host "[*] Loading environment variables from $path..."
+        Get-Content $path | ForEach-Object {
+            if ($_ -match "^(?<name>[^=]+)=(?<value>['""]?)(?<val>.*)\k<value>$") {
+                $varName = $Matches['name']
+                $varVal = $Matches['val']
+                # Only set if not already set by a more local .env
+                if (-not $env:$varName) {
+                    Set-Item -Path "env:$varName" -Value $varVal
+                }
+            }
         }
     }
 }
@@ -42,9 +49,17 @@ Write-Host "`n[4/4] Deploying SEM Agent to Cloud Run..."
 gcloud run deploy smart-email-manager-agent `
     --image $IMAGE `
     --platform managed --region $REGION --allow-unauthenticated `
-    --set-env-vars="MONGO_URI=$($env:MONGO_URI)" `
-    --set-env-vars="VOYAGE_API_KEY=$($env:VOYAGE_API_KEY)" `
-    --set-env-vars="PROJECT_ID=$PROJECT_ID"
+    --memory 1Gi --cpu 1 `
+    --set-env-vars="MONGO_URI=$($env:MONGO_URI),VOYAGE_API_KEY=$($env:VOYAGE_API_KEY),PROJECT_ID=$PROJECT_ID"
+
+# 3. Post-Deployment: Set CLOUD_RUN_URL
+$service_info = gcloud run services describe smart-email-manager-agent --platform managed --region $REGION
+$service_info_str = $service_info -join "`n"
+if ($service_info_str -match "URL:\s+(https?://\S+)") {
+    $SERVICE_URL = $Matches[1]
+    Write-Host "`n[*] Updating service with CLOUD_RUN_URL: $SERVICE_URL"
+    gcloud run services update smart-email-manager-agent --update-env-vars "CLOUD_RUN_URL=$SERVICE_URL" --region $REGION
+}
 
 Write-Host "`n✅ Smart Email Manager Stack Deployment Complete!"
 
@@ -134,7 +149,7 @@ if ($next_action -eq "1") {
     Write-Host "[*] Resolving Python dependencies..."
     pip install google-auth-oauthlib requests --quiet
     Write-Host "[*] Launching Step 5: Permanent Autonomy Sync..."
-    python "../permanent_auth.py"
+    python "./permanent_auth.py"
 } elseif ($next_action -eq "2") {
     Write-Host "[*] Transitioning to SAM Deployment..."
 }

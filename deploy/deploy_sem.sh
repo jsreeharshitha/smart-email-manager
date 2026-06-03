@@ -2,15 +2,16 @@
 
 # Master Deployment Script: Smart Email Manager Stack
 # --------------------------------------------------
-PROJECT_ID="grah-2026"
+PROJECT_ID=$(gcloud config get-value project)
 REGION="${CHOSEN_REGION:-us-central1}"
 IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/agent-repo/smart-email-manager-agent:latest"
 
-# 0. Load Secrets from .env (located in project root)
-ENV_FILE="../../../.env"
+# 0. Load Secrets from .env (located in submodule root)
+ENV_FILE="../.env"
 if [ -f "$ENV_FILE" ]; then
     echo "[*] Loading environment variables from .env..."
-    export $(grep -v '^#' "$ENV_FILE" | xargs)
+    # Robust loading: strip quotes and handle comments
+    export $(grep -v '^#' "$ENV_FILE" | sed 's/[\"'\'']//g' | xargs)
 fi
 
 # 1. Provision Vertex AI Infrastructure
@@ -40,9 +41,17 @@ echo -e "\n[4/4] Deploying SEM Agent to Cloud Run..."
 gcloud run deploy smart-email-manager-agent \
     --image $IMAGE \
     --platform managed --region $REGION --allow-unauthenticated \
-    --set-env-vars="MONGO_URI=$MONGO_URI" \
-    --set-env-vars="VOYAGE_API_KEY=$VOYAGE_API_KEY" \
-    --set-env-vars="PROJECT_ID=$PROJECT_ID"
+    --memory 1Gi --cpu 1 \
+    --set-env-vars="MONGO_URI=$MONGO_URI,VOYAGE_API_KEY=$VOYAGE_API_KEY,PROJECT_ID=$PROJECT_ID"
+
+# 3. Post-Deployment: Set CLOUD_RUN_URL
+SERVICE_INFO=$(gcloud run services describe smart-email-manager-agent --platform managed --region $REGION)
+SERVICE_URL=$(echo "$SERVICE_INFO" | grep -oP 'URL:\s+\K(https?://\S+)')
+
+if [ -n "$SERVICE_URL" ]; then
+    echo -e "\n[*] Updating service with CLOUD_RUN_URL: $SERVICE_URL"
+    gcloud run services update smart-email-manager-agent --update-env-vars CLOUD_RUN_URL=$SERVICE_URL --region $REGION
+fi
 
 echo -e "\n✅ Smart Email Manager Stack Deployment Complete!"
 
