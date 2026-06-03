@@ -18,7 +18,12 @@ def run_sync():
     
     # Discovery logic to find existing setup
     try:
-        service_url = os.popen('gcloud run services describe smart-email-manager-agent --platform managed --region us-central1 | awk "/URL:/ {print $2}').read().strip()
+        import re
+        # Get raw output to avoid --format bugs and awk dependency on Windows
+        describe_output = os.popen('gcloud run services describe smart-email-manager-agent --platform managed --region us-central1').read()
+        match = re.search(r"URL:\s+(https?://\S+)", describe_output)
+        service_url = match.group(1) if match else None
+        
         user_email = os.popen("gcloud config get-value account").read().strip()
         
         if not service_url or not user_email:

@@ -13,3 +13,7 @@ credentials.json
 token.json
 client-secret.json
 client_secret.json
+
+# Clasp configuration and temporary project
+.clasp.json
+deploy/tmp-clasp-watch/
