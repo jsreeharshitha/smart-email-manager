@@ -86,6 +86,49 @@ def generate_category_name(snippets: list) -> str:
         print(f"Vertex AI Error: {str(e)}")
         return f"cluster-{random.randint(100, 999)}"
 
+def sync_label_lifecycle(user_email: str):
+    """
+    Periodic Cleanup Phase:
+    Detects empty 'sem_' labels in Gmail and removes them from MongoDB to maintain system integrity.
+    """
+    try:
+        gmail_labels = get_labels(user_email)
+        active_sem_labels = [l for l in gmail_labels if l["name"].startswith("sem_") and l["name"] != UNCLASSIFIED_LABEL]
+        
+        # Identify empty categories
+        stale_labels = [l for l in active_sem_labels if l.get("messagesTotal", 0) == 0]
+        
+        if stale_labels:
+            client = get_client()
+            db = client[settings.DB_NAME]
+            email_collection = db["EmailData"]
+            label_collection = db["LabelMetadata"]
+            
+            stale_names = [l["name"] for l in stale_labels]
+            print(f"[*] CLEANUP: Found {len(stale_names)} empty sem_ labels: {stale_names}")
+            
+            # 1. Reset any emails in MongoDB that might still point to these (Ghost entries)
+            email_collection.update_many(
+                {"user_email": user_email, "label": {"$in": stale_names}},
+                {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
+            )
+            
+            # 2. Delete label metadata
+            label_collection.delete_many({"user_email": user_email, "label_name": {"$in": stale_names}})
+            
+            # 3. Physically delete from Gmail to keep user sidebar clean
+            for l in stale_labels:
+                try:
+                    delete_label(user_email, l["id"])
+                    print(f"[-] Deleted empty Gmail label: {l['name']}")
+                except:
+                    continue
+                    
+        return len(stale_labels)
+    except Exception as e:
+        print(f"Label Lifecycle Sync Error: {str(e)}")
+        return 0
+
 def reorganize_mails(user_email: str):
     """
     Workflow-Path-2 Orchestrator (Stable Fallback):
@@ -94,6 +137,9 @@ def reorganize_mails(user_email: str):
     3. Adaptive Thresholds: Sets a realistic bar for each label.
     """
     try:
+        # --- PRE-REORG CLEANUP ---
+        sync_label_lifecycle(user_email)
+
         # Load Dynamic Settings
         config = get_user_settings(user_email)
         
@@ -369,6 +415,9 @@ def perform_batch_classification(user_email: str):
     Enhanced with Long-Term Memory (UserPreferences).
     """
     try:
+        # --- PRE-CLASSIFICATION CLEANUP ---
+        sync_label_lifecycle(user_email)
+
         from tools.mongo_mcp import search_user_preferences
         
         # Load Dynamic Settings

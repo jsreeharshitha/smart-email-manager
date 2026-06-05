@@ -116,14 +116,27 @@ def delete_label(user_email: str, label_id: str) -> str:
 @mcp.tool()
 def get_labels(user_email: str) -> list:
     """
-    Retrieves all labels in the user's Gmail account as a list of dictionaries.
+    Retrieves all labels in the user's Gmail account.
+    Enhanced to fetch message counts for 'sem_' labels to identify empty categories.
     """
     try:
         service = get_gmail_service(user_email)
         results = service.users().labels().list(userId='me').execute()
         labels = results.get('labels', [])
 
-        return [{"id": l["id"], "name": l["name"]} for l in labels]
+        detailed_labels = []
+        for l in labels:
+            label_data = {"id": l["id"], "name": l["name"], "messagesTotal": 0}
+            # Only fetch details for our semantic labels to save API quota
+            if l["name"].startswith("sem_"):
+                try:
+                    full_l = service.users().labels().get(userId='me', id=l["id"]).execute()
+                    label_data["messagesTotal"] = full_l.get("messagesTotal", 0)
+                except:
+                    pass
+            detailed_labels.append(label_data)
+
+        return detailed_labels
 
     except Exception as e:
         print(f"Error fetching labels: {str(e)}")
