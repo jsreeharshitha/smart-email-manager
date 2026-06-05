@@ -2,10 +2,19 @@ from datetime import datetime, UTC, timedelta
 from tools.embedding_tool import generate_embedding
 from db.mongo_client import get_collection, get_client
 from tools.mongo_mcp import store_email_record, find_unclassified_by_semantic_group, setup_database
-from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id, delete_label, remove_label_from_email
+from tools.gmail_mcp import (
+    create_label, 
+    get_labels, 
+    apply_label_to_email, 
+    get_emails_by_id, 
+    delete_label, 
+    remove_label_from_email,
+    get_gmail_service
+)
 import json
 import os
 import numpy as np
+# ... (rest of imports unchanged)
 from sklearn.cluster import KMeans
 from config import settings
 import vertexai
@@ -148,6 +157,11 @@ def reorganize_mails(user_email: str):
             if isinstance(clusters, str): return clusters
             
             for cluster in clusters:
+                # OPTIMIZATION: Only create labels for clusters with 2 or more emails
+                if cluster["count"] < 2:
+                    print(f"[*] Cluster {cluster['cluster_id']} has only 1 email. Skipping label creation to prevent clutter.")
+                    continue
+
                 # 4. Generate AI Name
                 snippets = [rep["snippet"] for rep in cluster["representatives"]]
                 raw_name = generate_category_name(snippets)
@@ -309,12 +323,54 @@ def update_label_integrity(user_email: str, label_name: str):
         print(f"Integrity Calculation Error: {str(e)}")
         return f"Error: {str(e)}"
 
+def sync_by_time_range(user_email: str, minutes: int = 30):
+    """
+    Fetches and processes emails received within the last N minutes.
+    Memory-efficient fallback for large history gaps.
+    """
+    try:
+        service = get_gmail_service(user_email)
+        
+        # Calculate timestamp for Gmail query (seconds)
+        after_timestamp = int((datetime.now(UTC) - timedelta(minutes=minutes)).timestamp())
+        query = f"after:{after_timestamp}"
+        
+        print(f"[*] QUICK SYNC: Fetching emails since {minutes} mins ago (Query: {query})")
+        
+        results = service.users().messages().list(userId='me', q=query, maxResults=50).execute()
+        messages = results.get('messages', [])
+        
+        processed_count = 0
+        for msg in messages:
+            msg_id = msg['id']
+            try:
+                msg_detail = service.users().messages().get(userId='me', id=msg_id).execute()
+                metadata = {
+                    "subject": next((h['value'] for h in msg_detail.get('payload', {}).get('headers', []) if h['name'] == 'Subject'), "No Subject"),
+                    "message_id": msg_id,
+                    "user_email": user_email
+                }
+                process_and_store_email(metadata, msg_detail.get('snippet', ''))
+                processed_count += 1
+            except Exception as e:
+                print(f"Error processing {msg_id} during quick sync: {str(e)}")
+                continue
+            
+        print(f"[+] QUICK SYNC COMPLETE: Processed {processed_count} emails.")
+        return processed_count
+    except Exception as e:
+        print(f"Quick Sync Error: {str(e)}")
+        return 0
+
 def perform_batch_classification(user_email: str):
     """
     Track 3: STABLE Batch Classifier.
     Prioritizes existing labels and uses a high-confidence Stability Gate.
+    Enhanced with Long-Term Memory (UserPreferences).
     """
     try:
+        from tools.mongo_mcp import search_user_preferences
+        
         # Load Dynamic Settings
         config = get_user_settings(user_email)
         
@@ -344,12 +400,18 @@ def perform_batch_classification(user_email: str):
         unclassified_id = get_sem_unclassified_id(user_email)
         match_count = 0
         
+        # Initialize Gemini for Memory Reconciliation (if needed)
+        project_id = os.getenv("PROJECT_ID", "grah-2026")
+        vertexai.init(project=project_id, location="global")
+        model = GenerativeModel("gemini-3.5-flash")
+
         for email in unclassified:
             new_vec = np.array(email["vector_embedding"])
             best_match_label = None
             highest_score = -1.0
             target_threshold = config["DEFAULT_SIMILARITY_THRESHOLD"]
 
+            # --- 2a. Standard Centroid Search ---
             for lbl in labels_meta:
                 centroid = np.array(lbl["centroid_vector"])
                 score = calculate_cosine_similarity(new_vec, centroid)
@@ -358,24 +420,63 @@ def perform_batch_classification(user_email: str):
                     best_match_label = lbl["label_name"]
                     target_threshold = lbl.get("threshold_score", config["DEFAULT_SIMILARITY_THRESHOLD"])
 
-            # 3. ADAPTIVE STABILITY GATE: Use the label's specific threshold_score or system default
-            if highest_score > target_threshold and best_match_label in active_label_map:
-                label_id = active_label_map[best_match_label]
+            # --- 2b. Long-Term Memory Search (Context Enrichment) ---
+            memory_json = search_user_preferences(user_email, email["vector_embedding"])
+            memories = json.loads(memory_json)
+            best_memory = memories[0] if memories and memories[0].get("score", 0) > 0.8 else None
+
+            # --- 3. ADAPTIVE STABILITY GATE & MEMORY RECONCILIATION ---
+            final_label = best_match_label
+            final_score = highest_score
+            should_apply = highest_score > target_threshold
+
+            if best_memory and best_memory.get("confidence_score", 0) > 0.8:
+                # Use Gemini to reconcile centroid match with semantic memory
+                prompt = f"""
+                You are a Personal Email Assistant. Decide if this email should be categorized based on a learned preference.
+                
+                EMAIL SNIPPET: {email.get('snippet')}
+                CENTROID MATCH: {best_match_label} (Score: {highest_score:.2f})
+                LEARNED PREFERENCE: {best_memory.get('llm_semantic_note')}
+                PREFERRED ACTION: {best_memory.get('structured_rule', {}).get('preferred_action')}
+                
+                If the preference is strong and applies, return the preferred action or confirm the label.
+                Return ONLY a JSON: {{"action": "archive|label", "label": "label_name", "reason": "..."}}
+                """
+                try:
+                    res = model.generate_content(prompt)
+                    decision = json.loads(res.text.strip().replace("```json", "").replace("```", ""))
+                    if decision.get("action") == "archive":
+                        # Logic for archive could be added here
+                        pass 
+                    if decision.get("label") and decision["label"] in active_label_map:
+                        final_label = decision["label"]
+                        should_apply = True
+                        print(f"[*] MEMORY OVERRIDE: {email.get('message_id')} categorized as {final_label}")
+                except:
+                    pass
+
+            if should_apply and final_label in active_label_map:
+                label_id = active_label_map[final_label]
                 gmail_id = email.get("message_id")
                 
                 email_collection.update_one(
                     {"_id": email["_id"]},
-                    {"$set": {"label": best_match_label, "email_semantic_score": float(highest_score)}}
+                    {"$set": {"label": final_label, "email_semantic_score": float(final_score)}}
                 )
                 try:
                     apply_label_to_email(user_email, gmail_id, label_id)
                     if unclassified_id:
                         remove_label_from_email(user_email, gmail_id, unclassified_id)
-                    incremental_update_label_integrity(user_email, best_match_label, email["vector_embedding"])
+                    incremental_update_label_integrity(user_email, final_label, email["vector_embedding"])
                     match_count += 1
                 except: continue
         
         return f"Stable classification complete. Categorized {match_count} emails."
+
+    except Exception as e:
+        print(f"Stable Batch Classification Error: {str(e)}")
+        return f"Error: {str(e)}"
 
     except Exception as e:
         print(f"Stable Batch Classification Error: {str(e)}")
@@ -393,6 +494,7 @@ def process_and_store_email(email_metadata: dict, email_body: str):
         "label": "unclassified",
         "email_semantic_score": 0.0,
         "processed_at": datetime.now(UTC).isoformat(),
+        "arrival_at": datetime.now(UTC).isoformat(), # Explicit arrival for lifecycle analysis
         "snippet": email_body[:200]
     }
 

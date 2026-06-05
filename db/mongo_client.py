@@ -2,15 +2,23 @@ from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from config import settings
 
+_mongo_client = None
+
 def get_client():
-    """Initializes and returns the MongoDB client with optimized handshake settings."""
-    return MongoClient(
-        settings.MONGO_URI, 
-        server_api=ServerApi('1'),
-        connectTimeoutMS=10000, # 10s limit for initial connection
-        retryWrites=True,
-        retryReads=True
-    )
+    """Initializes and returns the MongoDB client, caching it for reuse."""
+    global _mongo_client
+    if _mongo_client is None:
+        _mongo_client = MongoClient(
+            settings.MONGO_URI, 
+            server_api=ServerApi('1'),
+            connectTimeoutMS=10000, 
+            socketTimeoutMS=10000,
+            serverSelectionTimeoutMS=10000,
+            retryWrites=True,
+            retryReads=True,
+            maxPoolSize=10
+        )
+    return _mongo_client
 
 def get_collection(collection_name=None):
     """Initializes and returns a MongoDB collection."""

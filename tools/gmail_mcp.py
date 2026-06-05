@@ -227,3 +227,29 @@ def get_emails_by_id(user_email: str, email_id: str) -> str:
 
     except Exception as e:
         return f"Unexpected error: {str(e)}"
+
+@mcp.tool()
+def send_email(user_email: str, to: str, subject: str, body: str) -> str:
+    """
+    Sends an email from the user's account. Used for proactive notifications.
+    """
+    try:
+        from email.mime.text import MIMEText
+        import base64
+
+        service = get_gmail_service(user_email)
+        message = MIMEText(body)
+        message['to'] = to
+        message['from'] = 'me'
+        message['subject'] = subject
+        
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+        
+        service.users().messages().send(
+            userId='me',
+            body={'raw': raw_message}
+        ).execute()
+        
+        return f"Email successfully sent to {to}"
+    except Exception as e:
+        return f"Error sending email: {str(e)}"
