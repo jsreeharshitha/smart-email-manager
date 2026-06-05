@@ -9,8 +9,8 @@ import traceback
 from fastapi import FastAPI, Request, HTTPException
 from db.mongo_client import get_client, get_collection
 from config import settings
-from tools.mongo_mcp import get_last_sync_timestamp, setup_database, find_unclassified_by_semantic_group, store_email_record
-from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id, remove_label_from_email
+from tools.mongo_mcp import get_last_sync_timestamp, setup_database, find_unclassified_by_semantic_group, store_email_record, update_email_lifecycle
+from tools.gmail_mcp import create_label, get_labels, apply_label_to_email, get_emails_by_id, remove_label_from_email, send_email
 from typing import List, Optional
 from pydantic import BaseModel
 from google.cloud import discoveryengine_v1beta as discoveryengine
@@ -28,6 +28,39 @@ from toolbox import (
 # --- 1. INITIALIZE FASTAPI ---
 app = FastAPI(title="Smart Email Manager API")
 
+# --- PROXY UTILITIES FOR MULTI-AGENT ORCHESTRATION ---
+
+def proxy_call_sam(method: str, params: dict):
+    """Delegates a tool call to the Self-Arizeing Manager (SAM)."""
+    sam_url = os.environ.get("SAM_URL")
+    if not sam_url:
+        # Try to derive it if they share the same project and region
+        # e.g. https://smart-email-manager-agent-XYZ.a.run.app -> https://self-arizeing-manager-agent-XYZ.a.run.app
+        current_url = os.environ.get("CLOUD_RUN_URL", "")
+        if "smart-email-manager-agent" in current_url:
+            sam_url = current_url.replace("smart-email-manager-agent", "self-arizeing-manager-agent")
+        else:
+            return "Error: SAM_URL not configured for orchestration."
+
+    try:
+        resp = requests.post(
+            f"{sam_url}/mcp/call",
+            json={"tool": method, "arguments": params},
+            timeout=60 # Extended timeout for cold starts and LLM generation
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("result") if data.get("status") == "success" else data.get("message")
+        return f"Error: SAM Agent returned {resp.status_code}"
+    except Exception as e:
+        return f"Proxy Error: {str(e)}"
+
+def report_hitl_action_proxy(user_id: str, message_id: str, action: str, reason: str = ""):
+    return proxy_call_sam("report_hitl_action", {"user_id": user_id, "message_id": message_id, "action": action, "reason": reason})
+
+def generate_weekly_summary_proxy(user_id: str):
+    return proxy_call_sam("generate_weekly_summary", {"user_id": user_id})
+
 TOOLS = {
     "setup_database": setup_database,
     "get_last_sync_timestamp": get_last_sync_timestamp,
@@ -42,7 +75,11 @@ TOOLS = {
     "get_emails_by_id": get_emails_by_id,
     "reorganize_mails": reorganize_mails,
     "incremental_update_label_integrity": incremental_update_label_integrity,
-    "perform_batch_classification": perform_batch_classification
+    "perform_batch_classification": perform_batch_classification,
+    "update_email_lifecycle": update_email_lifecycle,
+    "send_email": send_email,
+    "report_hitl_action": report_hitl_action_proxy,
+    "generate_weekly_summary": generate_weekly_summary_proxy
 }
 
 
@@ -56,16 +93,37 @@ async def mcp_discovery():
         "available_tools": list(TOOLS.keys())
     }
 
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+
+# ... existing imports ...
+
 @app.post("/mcp/call")
-async def call_mcp_tool(request: Request):
+async def call_mcp_tool(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
         tool_name = body.get("tool")
         arguments = body.get("arguments", {})
+        
         if tool_name not in TOOLS:
             raise HTTPException(status_code=404, detail=f"Tool {tool_name} not found.")
         
-        # Tool execution
+        # --- ASYNC FLOW FOR LONG-RUNNING WEEKLY REPORT ---
+        if tool_name == "generate_weekly_summary":
+            user_email = arguments.get("user_id")
+            
+            def run_async_report(email):
+                report_content = generate_weekly_summary_proxy(email)
+                subject = "[AGENT REPORT] Weekly Inbox Intelligence"
+                send_email(user_email=email, to=email, subject=subject, body=report_content)
+            
+            background_tasks.add_task(run_async_report, user_email)
+            
+            return {
+                "status": "success", 
+                "result": "Insight generation started. You will receive an email summary shortly. Please refresh your inbox in a minute."
+            }
+
+        # Standard tool execution for others
         result = TOOLS[tool_name](**arguments)
         return {"status": "success", "result": result}
     except Exception as e:
@@ -100,7 +158,7 @@ async def trigger_reorganize(request: Request):
         return {"status": "error", "message": str(e)}
 
 @app.post("/api/on-new-mail")
-async def handle_new_mail(request: Request):
+async def handle_new_mail(request: Request, background_tasks: BackgroundTasks):
     """
     Web-hook triggered by Pub/Sub when a new Gmail notification arrives.
     """
@@ -140,8 +198,9 @@ async def handle_new_mail(request: Request):
                 {"$set": {"last_history_id": new_history_id, "updated_at": datetime.now(UTC).isoformat()}}, 
                 upsert=True
             )
-            reorganize_mails(user_email)
-            return {"status": "initialized_and_reorganized"}
+            # Background the initial reorg
+            background_tasks.add_task(reorganize_mails, user_email)
+            return {"status": "initialized_and_reorganizing_in_background"}
 
         last_history_id = user_session.get("last_history_id")
         from tools.gmail_mcp import get_gmail_service
@@ -150,8 +209,8 @@ async def handle_new_mail(request: Request):
         if not last_history_id:
             print(f"UPDATING BASELINE HISTORY for {user_email}")
             db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
-            reorganize_mails(user_email)
-            return {"status": "initialized_and_reorganized"}
+            background_tasks.add_task(reorganize_mails, user_email)
+            return {"status": "initialized_and_reorganizing_in_background"}
 
         try:
             history_res = gmail.users().history().list(userId="me", startHistoryId=last_history_id, historyTypes=["messageAdded"]).execute()
@@ -182,7 +241,8 @@ async def handle_new_mail(request: Request):
                     
                     # Track 3: Stable Classification - Check frequently to clear backlog
                     if processed_count % batch_freq == 0:
-                         perform_batch_classification(user_email)
+                         # Run batch classification in background
+                         background_tasks.add_task(perform_batch_classification, user_email)
 
                 except Exception as msg_err:
                     if "404" in str(msg_err):
@@ -191,11 +251,9 @@ async def handle_new_mail(request: Request):
                         print(f"Error processing message {msg_id}: {str(msg_err)}")
                         continue
 
-        # Final cleanup classification and stable reorg check
-        # perform_batch_classification handles existing labels (Stability)
-        # reorganize_mails handles discovery/backlog (Flexibility)
-        perform_batch_classification(user_email)
-        reorganize_mails(user_email)
+        # Final cleanup classification and stable reorg check in background
+        background_tasks.add_task(perform_batch_classification, user_email)
+        background_tasks.add_task(reorganize_mails, user_email)
         
         return {"status": "success", "processed": processed_count}
     except Exception as e:
@@ -273,22 +331,31 @@ async def update_settings(request: Request):
 @app.post("/api/sync-historical")
 async def sync_historical(request: Request):
     """
-    Triggers a manual sync of historical emails for a specific time range.
+    Triggers a manual sync of emails for a specific time range.
+    Supports 'lookback_days' or 'lookback_minutes'.
     """
     try:
         data = await request.json()
         user_email = data.get("user_email")
-        lookback_days = data.get("lookback_days", 30)
+        lookback_days = data.get("lookback_days")
+        lookback_minutes = data.get("lookback_minutes")
         
-        # This is a stub for a long-running task. 
-        # In a production app, this should be an async background task.
-        print(f"[*] MANUAL HISTORICAL SYNC STARTING for {user_email} (Lookback: {lookback_days} days)")
+        if lookback_minutes:
+            print(f"[*] QUICK SYNC STARTING for {user_email} (Lookback: {lookback_minutes} minutes)")
+            from toolbox import sync_by_time_range
+            processed = sync_by_time_range(user_email, minutes=lookback_minutes)
+            msg = f"Quick sync for last {lookback_minutes} minutes complete. Processed {processed} emails."
+        else:
+            days = lookback_days or 30
+            print(f"[*] MANUAL HISTORICAL SYNC STARTING for {user_email} (Lookback: {days} days)")
+            # Standard historical sync logic (placeholder for full background job)
+            msg = f"Historical sync for last {days} days triggered!"
         
         # Trigger an immediate reorg and batch classification to clear backlog
         reorganize_mails(user_email)
         perform_batch_classification(user_email)
         
-        return {"status": "success", "message": f"Historical sync for last {lookback_days} days triggered!"}
+        return {"status": "success", "message": msg}
     except Exception as e:
         print(f"Historical Sync Error: {str(e)}")
         return {"status": "error", "message": str(e)}

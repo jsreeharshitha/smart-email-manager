@@ -41,7 +41,7 @@ echo -e "\n[4/4] Deploying SEM Agent to Cloud Run..."
 gcloud run deploy smart-email-manager-agent \
     --image $IMAGE \
     --platform managed --region $REGION --allow-unauthenticated \
-    --memory 1Gi --cpu 1 \
+    --memory 4Gi --cpu 1 --concurrency 10 \
     --set-env-vars="MONGO_URI=$MONGO_URI,VOYAGE_API_KEY=$VOYAGE_API_KEY,PROJECT_ID=$PROJECT_ID"
 
 # 3. Post-Deployment: Set CLOUD_RUN_URL
