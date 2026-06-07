@@ -149,7 +149,7 @@ def sync_label_lifecycle(user_email: str):
                 {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
             )
             
-        return len(stale_labels) + len(ghost_labels)
+        return len(stale_labels_info) + len(ghost_labels)
     except Exception as e:
         print(f"Label Lifecycle Sync Error: {str(e)}")
         return 0
