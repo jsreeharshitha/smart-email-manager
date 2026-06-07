@@ -703,17 +703,22 @@ def build_strong_labels(user_email: str):
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
     Coordinates embedding generation and storage.
-    Now supports enriched metadata (thread_id, sent_at) for analytics.
+    Now implements Dual-Write: Voyage AI (Legacy) + Vertex AI (BigQuery Search).
     """
-    embedding = generate_embedding(email_body)
+    from tools.embedding_tool import generate_embedding, generate_vertex_embedding
+    
+    # 1. Generate both embeddings
+    voyage_embedding = generate_embedding(email_body)
+    vertex_embedding = generate_vertex_embedding(email_body)
 
     document = {
         **email_metadata,
-        "vector_embedding": embedding,
+        "vector_embedding": voyage_embedding, # Primary for MongoDB search
+        "vertex_embedding": vertex_embedding, # Target for BigQuery search
         "label": "unclassified",
         "email_semantic_score": 0.0,
         "processed_at": datetime.now(UTC).isoformat(),
-        "arrival_at": datetime.now(UTC).isoformat(), # Explicit arrival for lifecycle analysis
+        "arrival_at": datetime.now(UTC).isoformat(), 
         "snippet": email_body[:200]
     }
 
