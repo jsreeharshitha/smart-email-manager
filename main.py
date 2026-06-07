@@ -19,7 +19,7 @@ from datetime import datetime, UTC
 from toolbox import (
     process_and_store_email, 
     cluster_unclassified_emails, 
-    reorganize_mails, 
+    demolish_weak_labels, 
     incremental_update_label_integrity,
     perform_batch_classification,
     get_user_settings
@@ -73,7 +73,7 @@ TOOLS = {
     "apply_label_to_email": apply_label_to_email,
     "remove_label_from_email": remove_label_from_email,
     "get_emails_by_id": get_emails_by_id,
-    "reorganize_mails": reorganize_mails,
+    "demolish_weak_labels": demolish_weak_labels,
     "incremental_update_label_integrity": incremental_update_label_integrity,
     "perform_batch_classification": perform_batch_classification,
     "update_email_lifecycle": update_email_lifecycle,
@@ -150,7 +150,7 @@ async def trigger_reorganize(request: Request):
         print(f"REORG EVENT RECEIVED for {user_email} (Reason: {reason})")
         
         # Execute the orchestrator
-        result = reorganize_mails(user_email)
+        result = demolish_weak_labels(user_email)
         return {"status": "success", "result": result}
         
     except Exception as e:
@@ -198,8 +198,8 @@ async def handle_new_mail(request: Request, background_tasks: BackgroundTasks):
                 {"$set": {"last_history_id": new_history_id, "updated_at": datetime.now(UTC).isoformat()}}, 
                 upsert=True
             )
-            # Background the initial reorg
-            background_tasks.add_task(reorganize_mails, user_email)
+            # Background the initial demolish phase
+            background_tasks.add_task(demolish_weak_labels, user_email)
             return {"status": "initialized_and_reorganizing_in_background"}
 
         last_history_id = user_session.get("last_history_id")
@@ -209,7 +209,7 @@ async def handle_new_mail(request: Request, background_tasks: BackgroundTasks):
         if not last_history_id:
             print(f"UPDATING BASELINE HISTORY for {user_email}")
             db["UserSessions"].update_one({"user_email": user_email}, {"$set": {"last_history_id": new_history_id}})
-            background_tasks.add_task(reorganize_mails, user_email)
+            background_tasks.add_task(demolish_weak_labels, user_email)
             return {"status": "initialized_and_reorganizing_in_background"}
 
         try:
@@ -262,7 +262,7 @@ async def handle_new_mail(request: Request, background_tasks: BackgroundTasks):
 
         # Final cleanup classification and stable reorg check in background
         background_tasks.add_task(perform_batch_classification, user_email)
-        background_tasks.add_task(reorganize_mails, user_email)
+        background_tasks.add_task(demolish_weak_labels, user_email)
         
         return {"status": "success", "processed": processed_count}
     except Exception as e:
@@ -361,7 +361,7 @@ async def sync_historical(request: Request):
             msg = f"Historical sync for last {days} days triggered!"
         
         # Trigger an immediate reorg and batch classification to clear backlog
-        reorganize_mails(user_email)
+        demolish_weak_labels(user_email)
         perform_batch_classification(user_email)
         
         return {"status": "success", "message": msg}

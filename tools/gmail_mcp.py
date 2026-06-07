@@ -62,7 +62,7 @@ def get_gmail_service(user_email: str):
             except Exception as re_err:
                 print(f"[!] Proactive Refresh Failed: {str(re_err)}. Continuing with existing token...")
         
-        return build('gmail', 'v1', credentials=creds)
+        return build('gmail', 'v1', credentials=creds, cache_discovery=False)
 
     except Exception as e:
         print(f"Gmail Service Init Error: {str(e)}")
@@ -118,29 +118,114 @@ def get_labels(user_email: str) -> list:
     """
     Retrieves all labels in the user's Gmail account.
     Enhanced to fetch message counts for 'sem_' labels to identify empty categories.
+    Raises an exception on failure to prevent downstream logic (like reorg) from
+    erroneously assuming all labels were deleted. Handles rate limiting with retries.
     """
+    import time
+    from googleapiclient.errors import HttpError
+    
     try:
         service = get_gmail_service(user_email)
-        results = service.users().labels().list(userId='me').execute()
-        labels = results.get('labels', [])
+        
+        # Retry logic for the main list call
+        for attempt in range(3):
+            try:
+                results = service.users().labels().list(userId='me').execute()
+                labels = results.get('labels', [])
+                break
+            except HttpError as e:
+                if e.resp.status == 429 and attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise e
 
         detailed_labels = []
         for l in labels:
             label_data = {"id": l["id"], "name": l["name"], "messagesTotal": 0}
             # Only fetch details for our semantic labels to save API quota
             if l["name"].startswith("sem_"):
-                try:
-                    full_l = service.users().labels().get(userId='me', id=l["id"]).execute()
-                    label_data["messagesTotal"] = full_l.get("messagesTotal", 0)
-                except:
-                    pass
+                # Retry logic for individual label details
+                for attempt in range(3):
+                    try:
+                        full_l = service.users().labels().get(userId='me', id=l["id"]).execute()
+                        label_data["messagesTotal"] = full_l.get("messagesTotal", 0)
+                        break
+                    except HttpError as e:
+                        if e.resp.status == 429 and attempt < 2:
+                            time.sleep(2 ** attempt)
+                            continue
+                        # If it's a 404 or persistent 429, just skip adding messagesTotal
+                        break
+                    except:
+                        break
             detailed_labels.append(label_data)
 
         return detailed_labels
 
     except Exception as e:
-        print(f"Error fetching labels: {str(e)}")
+        print(f"CRITICAL ERROR fetching labels: {str(e)}")
+        # Raise instead of returning [] to protect reorg logic from shredding
+        raise Exception(f"Failed to fetch Gmail labels: {str(e)}")
+
+@mcp.tool()
+def list_messages_in_label(user_email: str, label_name_or_id: str) -> list:
+    """
+    Lists all message IDs associated with a specific label.
+    Useful for integrity checks and synchronization.
+    """
+    try:
+        service = get_gmail_service(user_email)
+        
+        # 1. Resolve ID if name provided
+        label_id = label_name_or_id
+        if not label_id.startswith("Label_"): # Heuristic: Gmail IDs usually start with Label_
+            all_labels = get_labels(user_email)
+            target = next((l for l in all_labels if l['name'].lower() == label_name_or_id.lower()), None)
+            if not target: return []
+            label_id = target['id']
+
+        # 2. Fetch IDs (Handle pagination if backlog is very large)
+        message_ids = []
+        next_page_token = None
+        while True:
+            results = service.users().messages().list(userId='me', labelIds=[label_id], pageToken=next_page_token).execute()
+            messages = results.get('messages', [])
+            message_ids.extend([m['id'] for m in messages])
+            next_page_token = results.get('nextPageToken')
+            if not next_page_token or len(message_ids) > 500: # Cap for safety in hackathon
+                break
+                
+        return message_ids
+    except Exception as e:
+        print(f"Error listing messages in label {label_name_or_id}: {str(e)}")
         return []
+
+@mcp.tool()
+def batch_modify_emails(user_email: str, message_ids: list, add_label_ids: list = None, remove_label_ids: list = None) -> str:
+    """
+    Batch modifies labels for a list of message IDs.
+    Efficiently handles large reorganizations in a single request.
+    """
+    try:
+        if not message_ids:
+            return "No messages provided for batch modification."
+            
+        service = get_gmail_service(user_email)
+        body = {
+            'ids': message_ids,
+            'addLabelIds': add_label_ids or [],
+            'removeLabelIds': remove_label_ids or []
+        }
+        
+        service.users().messages().batchModify(
+            userId='me',
+            body=body
+        ).execute()
+        
+        return f"Successfully batch modified {len(message_ids)} emails."
+    except Exception as e:
+        print(f"Batch Modify Error: {str(e)}")
+        return f"Error during batch modification: {str(e)}"
 
 @mcp.tool()
 def apply_label_to_email(user_email: str, message_id: str, label_name_or_id: str) -> str:

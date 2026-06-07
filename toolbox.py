@@ -89,52 +89,77 @@ def generate_category_name(snippets: list) -> str:
 def sync_label_lifecycle(user_email: str):
     """
     Periodic Cleanup Phase:
-    Detects empty 'sem_' labels in Gmail and removes them from MongoDB to maintain system integrity.
+    Detects empty 'sem_' labels in Gmail and removes them from MongoDB.
+    Enforces a 2-hour Maturity Lock to prevent premature deletion.
     """
     try:
         gmail_labels = get_labels(user_email)
         active_sem_labels = [l for l in gmail_labels if l["name"].startswith("sem_") and l["name"] != UNCLASSIFIED_LABEL]
         
+        client = get_client()
+        db = client[settings.DB_NAME]
+        email_collection = db["EmailData"]
+        label_collection = db["LabelMetadata"]
+
         # Identify empty categories
-        stale_labels = [l for l in active_sem_labels if l.get("messagesTotal", 0) == 0]
+        stale_labels_info = [l for l in active_sem_labels if l.get("messagesTotal", 0) == 0]
         
-        if stale_labels:
-            client = get_client()
-            db = client[settings.DB_NAME]
-            email_collection = db["EmailData"]
-            label_collection = db["LabelMetadata"]
+        if stale_labels_info:
+            stale_names = [l["name"] for l in stale_labels_info]
             
-            stale_names = [l["name"] for l in stale_labels]
-            print(f"[*] CLEANUP: Found {len(stale_names)} empty sem_ labels: {stale_names}")
-            
-            # 1. Reset any emails in MongoDB that might still point to these (Ghost entries)
+            # --- MATURITY LOCK CHECK ---
+            # Only delete if label is > 2 hours old
+            now = datetime.now(UTC)
+            eligible_for_deletion = []
+            for name in stale_names:
+                meta = label_collection.find_one({"user_email": user_email, "label_name": name})
+                if meta and "created_at" in meta:
+                    created_at = datetime.fromisoformat(meta["created_at"])
+                    if now - created_at > timedelta(hours=2):
+                        eligible_for_deletion.append(name)
+                elif not meta:
+                    # If no metadata exists, it's an untracked label, safe to delete
+                    eligible_for_deletion.append(name)
+
+            if eligible_for_deletion:
+                print(f"[*] CLEANUP: Deleting {len(eligible_for_deletion)} mature empty labels: {eligible_for_deletion}")
+                email_collection.update_many(
+                    {"user_email": user_email, "label": {"$in": eligible_for_deletion}},
+                    {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
+                )
+                label_collection.delete_many({"user_email": user_email, "label_name": {"$in": eligible_for_deletion}})
+                
+                for l in stale_labels_info:
+                    if l["name"] in eligible_for_deletion:
+                        try:
+                            delete_label(user_email, l["id"])
+                        except: continue
+
+        # --- GHOST EMAIL RECOVERY ---
+        # ... (rest of function remains same)
+        # Detect emails in MongoDB that claim an sem_ label but are NOT in the active Gmail list.
+        # This fixes the drift where MongoDB thinks an email is organized but Gmail does not.
+        db_sem_labels = email_collection.distinct("label", {"user_email": user_email})
+        ghost_labels = [l for l in db_sem_labels if l.startswith("sem_") and l not in [lx["name"] for lx in gmail_labels] and l != UNCLASSIFIED_LABEL]
+        
+        if ghost_labels:
+            print(f"[*] RECOVERY: Found {len(ghost_labels)} ghost labels in DB. Resetting emails...")
             email_collection.update_many(
-                {"user_email": user_email, "label": {"$in": stale_names}},
+                {"user_email": user_email, "label": {"$in": ghost_labels}},
                 {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
             )
             
-            # 2. Delete label metadata
-            label_collection.delete_many({"user_email": user_email, "label_name": {"$in": stale_names}})
-            
-            # 3. Physically delete from Gmail to keep user sidebar clean
-            for l in stale_labels:
-                try:
-                    delete_label(user_email, l["id"])
-                    print(f"[-] Deleted empty Gmail label: {l['name']}")
-                except:
-                    continue
-                    
-        return len(stale_labels)
+        return len(stale_labels) + len(ghost_labels)
     except Exception as e:
         print(f"Label Lifecycle Sync Error: {str(e)}")
         return 0
 
-def reorganize_mails(user_email: str):
+def demolish_weak_labels(user_email: str):
     """
-    Workflow-Path-2 Orchestrator (Stable Fallback):
-    1. Cooldown Guard: Prevents infinite reorg loops.
-    2. Backlog Threshold: Only triggers if unclassified pile is significant.
-    3. Adaptive Thresholds: Sets a realistic bar for each label.
+    Workflow-Path-2 Orchestrator (The Demolisher):
+    1. Cooldown Guard: Prevents infinite loops.
+    2. Cleanup: Identifies and shreds weak/degraded or orphaned labels.
+    3. Trigger: Executes only if active labels > MAX_LABELS or degraded labels exist.
     """
     try:
         # --- PRE-REORG CLEANUP ---
@@ -154,107 +179,99 @@ def reorganize_mails(user_email: str):
         if session and "last_reorganized_at" in session:
             last_reorg = datetime.fromisoformat(session["last_reorganized_at"])
             if datetime.now(UTC) - last_reorg < timedelta(hours=config["REORG_COOLDOWN_HOURS"]):
-                print(f"[*] REORG COOLDOWN ACTIVE for {user_email}. Skipping reorganization.")
-                return "Cooldown active. Skipping reorg."
+                print(f"[*] DEMOLISH COOLDOWN ACTIVE for {user_email}. Skipping.")
+                return "Cooldown active. Skipping demolish."
 
-        # --- 2. BACKLOG THRESHOLD ---
-        # Only reorganize if we have a significant number of unclassified emails.
-        unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
-        
-        project_id = os.getenv("PROJECT_ID", "grah-2026")
-        vertexai.init(project=project_id, location="global")
-        
-        # 3. Get Current State
-        gmail_labels = get_labels(user_email)
+        # --- 2. STATE CHECK ---
+        try:
+            gmail_labels = get_labels(user_email)
+        except Exception as e:
+            print(f"[!] ABORTING DEMOLISH: Label sync failed: {str(e)}")
+            return f"Error: Label sync failed. preserving state."
+
         active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_") and l["name"] != UNCLASSIFIED_LABEL]
-        unclassified_id = get_sem_unclassified_id(user_email)
+        num_active_labels = len(active_gmail_sem_labels)
+        max_labels = config["MAX_SEMANTIC_LABELS"]
+        
+        # SAFETY GATE
+        db_sem_label_count = label_collection.count_documents({"user_email": user_email})
+        if not active_gmail_sem_labels and db_sem_label_count > 0:
+            print(f"[!] SAFETY TRIGGERED: Gmail returned 0 sem_ labels but DB has {db_sem_label_count}. Aborting demolish.")
+            return "Safety Gate: Aborted due to suspicious empty label list."
         
         # Detect labels that need resetting
         db_labels = email_collection.distinct("label", {"user_email": user_email})
         orphaned_labels = [l for l in db_labels if l.startswith("sem_") and l not in active_gmail_sem_labels and l != UNCLASSIFIED_LABEL]
         
         all_sem_meta = list(label_collection.find({"user_email": user_email}))
-        # Dynamic Check: Labels whose integrity is below their SPECIFIC adaptive threshold
-        degraded_labels = [l["label_name"] for l in all_sem_meta if l["semantic_integrity_score"] < l.get("threshold_score", 0.7)]
+        now = datetime.now(UTC)
         
-        labels_to_shred = list(set(orphaned_labels + degraded_labels))
+        labels_to_shred = []
+        for l in all_sem_meta:
+            name = l["label_name"]
+            integrity = l["semantic_integrity_score"]
+            threshold = l.get("threshold_score", 0.7)
+            
+            # --- MATURITY LOCK & BIRTH THRESHOLD ---
+            is_mature = False
+            if "created_at" in l:
+                created_at = datetime.fromisoformat(l["created_at"])
+                if now - created_at > timedelta(hours=2):
+                    is_mature = True
+            
+            # Shred Condition 1: Label is mature AND degraded
+            if is_mature and integrity < threshold:
+                labels_to_shred.append(name)
+                continue
+                
+            # Shred Condition 2: Label is a ghost/orphan
+            if name in orphaned_labels:
+                labels_to_shred.append(name)
+                continue
+                
+            # Shred Condition 3 (Advanced): Even if not mature, shred if it crashes below a panic level 
+            # (e.g. 10% below its own threshold)
+            if not is_mature and integrity < (threshold * 0.9):
+                print(f"[*] PANIC SHRED: {name} ({integrity}) crashed below birth-safety. Shredding early.")
+                labels_to_shred.append(name)
 
-        # TRIGGER CONDITION: Heavy backlog OR degraded/orphaned labels OR system starting fresh
-        if unclassified_count > config["BACKLOG_THRESHOLD"] or labels_to_shred or not active_gmail_sem_labels or len(active_gmail_sem_labels) > config["MAX_SEMANTIC_LABELS"]:
-            print(f"[*] REORG STARTING for {user_email} (Backlog: {unclassified_count})...")
+        # --- 3. EXECUTION TRIGGER ---
+        should_execute = (
+            num_active_labels > max_labels or 
+            len(labels_to_shred) > 0
+        )
+
+        if should_execute:
+            print(f"[*] DEMOLISH PHASE STARTING for {user_email}. Active labels: {num_active_labels}")
 
             if labels_to_shred:
+                print(f"[*] Shredding weak/orphaned labels: {labels_to_shred}")
                 email_collection.update_many(
                     {"user_email": user_email, "label": {"$in": labels_to_shred}},
                     {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
                 )
                 label_collection.delete_many({"user_email": user_email, "label_name": {"$in": labels_to_shred}})
                 
-                if len(active_gmail_sem_labels) > config["MAX_SEMANTIC_LABELS"]:
-                    for l_name in active_gmail_sem_labels:
+                # Cleanup Gmail if we are over the absolute maximum
+                if num_active_labels > max_labels:
+                    for l_name in labels_to_shred:
                         l_id = next((l["id"] for l in gmail_labels if l["name"] == l_name), None)
                         if l_id: delete_label(user_email, l_id)
 
-            # 3. Clustering (Capped at MAX_SEMANTIC_LABELS)
-            email_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
-            target_clusters = min(config["MAX_SEMANTIC_LABELS"], max(2, email_count // 5 if email_count < 25 else config["MAX_SEMANTIC_LABELS"]))
-            
-            clusters = cluster_unclassified_emails(user_email, n_clusters=target_clusters)
-            if isinstance(clusters, str): return clusters
-            
-            for cluster in clusters:
-                # OPTIMIZATION: Only create labels for clusters with 2 or more emails
-                if cluster["count"] < 2:
-                    print(f"[*] Cluster {cluster['cluster_id']} has only 1 email. Skipping label creation to prevent clutter.")
-                    continue
-
-                # 4. Generate AI Name
-                snippets = [rep["snippet"] for rep in cluster["representatives"]]
-                raw_name = generate_category_name(snippets)
-                category_name = "sem_" + raw_name
-                
-                # 5. Create in Gmail
-                new_label = create_label(user_email, category_name)
-                label_id = new_label.get("id")
-                if not label_id: continue
-                
-                # 6. Apply & Lock
-                email_data_list = cluster["all_emails"]
-                for item in email_data_list:
-                    mongo_id = item["mongo_id"]
-                    gmail_id = item["gmail_id"]
-                    # DATA PRESERVATION: Only update the label. 
-                    # thread_id and sent_at are preserved for Inbox-Analytics.
-                    email_collection.update_one({"_id": ObjectId(mongo_id)}, {"$set": {"label": category_name}})
-                    try:
-                        apply_label_to_email(user_email, gmail_id, label_id)
-                        if unclassified_id: remove_label_from_email(user_email, gmail_id, unclassified_id)
-                    except: continue
-                
-                # 7. ADAPTIVE THRESHOLD SETTING
-                # We calculate the starting integrity and set the threshold at a hysteresis % of that.
-                meta_res = update_label_integrity(user_email, category_name)
-                if isinstance(meta_res, dict):
-                    achieved_score = meta_res["integrity_score"]
-                    # Hysteresis: The bar is set lower than what we just achieved
-                    adaptive_threshold = max(0.6, achieved_score * config["ADAPTIVE_THRESHOLD_HYSTERESIS"])
-                    label_collection.update_one(
-                        {"user_email": user_email, "label_name": category_name},
-                        {"$set": {"threshold_score": adaptive_threshold}}
-                    )
-
-            # 8. UPDATE COOLDOWN
+            # --- 4. LOCK ---
             session_collection.update_one(
                 {"user_email": user_email},
                 {"$set": {"last_reorganized_at": datetime.now(UTC).isoformat()}},
                 upsert=True
             )
-            return "Reorganization complete. System stabilized."
+            return "Demolish complete. Weak labels removed."
         
-        return "Inbox is healthy."
+        return "Inbox is healthy. No demolition needed."
         
     except Exception as e:
-        print(f"Reorg Error: {str(e)}")
+        print(f"Demolish Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return f"Error: {str(e)}"
 
 def incremental_update_label_integrity(user_email: str, label_name: str, new_embedding: list):
@@ -356,6 +373,9 @@ def update_label_integrity(user_email: str, label_name: str):
                     "centroid_vector": centroid.tolist(),
                     "last_calculated_at": datetime.now(UTC).isoformat(),
                     "email_count": len(emails)
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.now(UTC).isoformat()
                 }
             },
             upsert=True
@@ -410,6 +430,42 @@ def sync_by_time_range(user_email: str, minutes: int = 30):
         print(f"Quick Sync Error: {str(e)}")
         return 0
 
+def sync_unclassified_integrity(user_email: str):
+    """
+    Self-Healing: Ensures all 'unclassified' emails in MongoDB are labeled 'sem_unclassified' in Gmail.
+    Fixes the drift caused by transient initial intake failures.
+    """
+    try:
+        from tools.gmail_mcp import list_messages_in_label, batch_modify_emails
+        
+        # 1. Get MongoDB unclassified IDs
+        client = get_client()
+        db = client[settings.DB_NAME]
+        email_collection = db["EmailData"]
+        mongo_unclassified_ids = email_collection.distinct("message_id", {"user_email": user_email, "label": "unclassified"})
+        
+        if not mongo_unclassified_ids:
+            return 0
+            
+        # 2. Get Gmail sem_unclassified IDs
+        gmail_unclassified_ids = list_messages_in_label(user_email, UNCLASSIFIED_LABEL)
+        
+        # 3. Find the Delta: In DB but NOT in Gmail label
+        missing_ids = list(set(mongo_unclassified_ids) - set(gmail_unclassified_ids))
+        
+        if missing_ids:
+            print(f"[*] INTEGRITY SYNC: Found {len(missing_ids)} emails missing 'sem_unclassified' label in Gmail. Fixing...")
+            unclassified_id = get_sem_unclassified_id(user_email)
+            if unclassified_id:
+                # Use batch modify for efficiency
+                batch_modify_emails(user_email, missing_ids, add_label_ids=[unclassified_id])
+                print(f"[+] Fixed {len(missing_ids)} emails in Gmail.")
+        
+        return len(missing_ids)
+    except Exception as e:
+        print(f"Unclassified Integrity Error: {str(e)}")
+        return 0
+
 def perform_batch_classification(user_email: str):
     """
     Track 3: STABLE Batch Classifier.
@@ -417,8 +473,9 @@ def perform_batch_classification(user_email: str):
     Enhanced with Long-Term Memory (UserPreferences).
     """
     try:
-        # --- PRE-CLASSIFICATION CLEANUP ---
+        # --- PRE-CLASSIFICATION CLEANUP & INTEGRITY ---
         sync_label_lifecycle(user_email)
+        sync_unclassified_integrity(user_email)
 
         from tools.mongo_mcp import search_user_preferences
         
@@ -437,7 +494,8 @@ def perform_batch_classification(user_email: str):
         active_label_map = {l["name"]: l["id"] for l in gmail_labels if l["name"].startswith("sem_")}
         
         if not active_label_map:
-            return "No active sem_ labels found in Gmail. Waiting for reorganization."
+            print("[*] No active sem_ labels found in Gmail. Handing off to Architect for initialization.")
+            return build_strong_labels(user_email)
 
         # 2. Get metadata ONLY for these active labels
         labels_meta = list(label_collection.find({
@@ -446,7 +504,8 @@ def perform_batch_classification(user_email: str):
         }))
 
         if not labels_meta:
-            return "No metadata found for active labels."
+            print("[*] No metadata found for active labels. Handing off to Architect for recovery.")
+            return build_strong_labels(user_email)
 
         unclassified_id = get_sem_unclassified_id(user_email)
         match_count = 0
@@ -469,7 +528,8 @@ def perform_batch_classification(user_email: str):
                 if score > highest_score:
                     highest_score = score
                     best_match_label = lbl["label_name"]
-                    target_threshold = lbl.get("threshold_score", config["DEFAULT_SIMILARITY_THRESHOLD"])
+                    # Pattern A Relaxation: Easier to join degraded labels
+                    target_threshold = min(lbl.get("threshold_score", config["DEFAULT_SIMILARITY_THRESHOLD"]), config["DEFAULT_SIMILARITY_THRESHOLD"])
 
             # --- 2b. Long-Term Memory Search (Context Enrichment) ---
             memory_json = search_user_preferences(user_email, email["vector_embedding"])
@@ -523,15 +583,122 @@ def perform_batch_classification(user_email: str):
                     match_count += 1
                 except: continue
         
-        return f"Stable classification complete. Categorized {match_count} emails."
+        res_msg = f"Stable classification complete. Categorized {match_count} emails."
+        
+        # --- 4. HANDOFF TO ARCHITECT ---
+        remaining_unclassified = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
+        if remaining_unclassified > config["BACKLOG_THRESHOLD"]:
+            print(f"[*] Batch Classifier handing off to Architect. Backlog: {remaining_unclassified}")
+            return res_msg + " " + build_strong_labels(user_email)
+            
+        return res_msg
 
     except Exception as e:
         print(f"Stable Batch Classification Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return f"Error: {str(e)}"
 
+def build_strong_labels(user_email: str):
+    """
+    Workflow-Path-3 Orchestrator (The Architect):
+    Creates new semantic categories when the backlog gets too large.
+    Enforces a 30-minute lock to prevent concurrent build bursts.
+    """
+    try:
+        config = get_user_settings(user_email)
+        client = get_client()
+        db = client[settings.DB_NAME]
+        email_collection = db["EmailData"]
+        label_collection = db["LabelMetadata"]
+        session_collection = db["UserSessions"]
+
+        # --- ARCHITECT COOLDOWN ---
+        session = session_collection.find_one({"user_email": user_email})
+        if session and "last_built_at" in session:
+            last_build = datetime.fromisoformat(session["last_built_at"])
+            if datetime.now(UTC) - last_build < timedelta(minutes=30):
+                print(f"[*] ARCHITECT COOLDOWN ACTIVE for {user_email}. Skipping.")
+                return "Architect Cooldown active."
+
+        try:
+            gmail_labels = get_labels(user_email)
+        except: 
+            return "Builder: Gmail sync failed."
+        
+        active_gmail_sem_labels = [l["name"] for l in gmail_labels if l["name"].startswith("sem_") and l["name"] != UNCLASSIFIED_LABEL]
+        unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
+        
+        # GUARDS
+        if len(active_gmail_sem_labels) > config["MAX_SEMANTIC_LABELS"] + 2:
+            return "Builder Guard: Too many active labels. Waiting for demolisher."
+        if unclassified_count <= config["BACKLOG_THRESHOLD"]:
+            return "Builder Guard: Backlog resolved by classifier."
+            
+        print(f"[*] BUILDER PHASE STARTING for {user_email}. Generating new categories...")
+
+        # Update Last Built timestamp immediately to act as a lock
+        session_collection.update_one(
+            {"user_email": user_email},
+            {"$set": {"last_built_at": datetime.now(UTC).isoformat()}},
+            upsert=True
+        )
+        
+        unclassified_id = get_sem_unclassified_id(user_email)
+        
+        # Calculate target clusters
+        target_clusters = min(config["MAX_SEMANTIC_LABELS"], max(2, unclassified_count // 5 if unclassified_count < 25 else config["MAX_SEMANTIC_LABELS"]))
+        
+        clusters = cluster_unclassified_emails(user_email, n_clusters=target_clusters)
+        if isinstance(clusters, str): return clusters
+        
+        created_count = 0
+        for cluster in clusters:
+            if cluster["count"] < 2: continue
+            
+            snippets = [rep["snippet"] for rep in cluster["representatives"]]
+            raw_name = generate_category_name(snippets)
+            category_name = "sem_" + raw_name
+            
+            new_label = create_label(user_email, category_name)
+            label_id = new_label.get("id")
+            if not label_id: continue
+            
+            email_data_list = cluster["all_emails"]
+            gmail_ids = [item["gmail_id"] for item in email_data_list]
+            
+            try:
+                from tools.gmail_mcp import batch_modify_emails
+                remove_ids = [unclassified_id] if unclassified_id else []
+                batch_res = batch_modify_emails(user_email, gmail_ids, add_label_ids=[label_id], remove_label_ids=remove_ids)
+                
+                if "Successfully" in batch_res:
+                    for item in email_data_list:
+                        email_collection.update_one({"_id": ObjectId(item["mongo_id"])}, {"$set": {"label": category_name}})
+                    
+                    # Initialize Hysteresis Threshold
+                    update_label_integrity(user_email, category_name)
+                    meta = label_collection.find_one({"user_email": user_email, "label_name": category_name})
+                    if meta:
+                        achieved_score = meta.get("semantic_integrity_score", 0.85)
+                        adaptive_threshold = max(0.6, achieved_score * config["ADAPTIVE_THRESHOLD_HYSTERESIS"])
+                        label_collection.update_one(
+                            {"user_email": user_email, "label_name": category_name},
+                            {"$set": {"threshold_score": adaptive_threshold}}
+                        )
+                    created_count += 1
+                    print(f"[+] Architect built {category_name} with {len(gmail_ids)} emails.")
+            except Exception as e:
+                print(f"Builder Batch Error: {str(e)}")
+                continue
+                
+        return f"Architect built {created_count} new categories."
+        
     except Exception as e:
-        print(f"Stable Batch Classification Error: {str(e)}")
-        return f"Error: {str(e)}"
+        print(f"Builder Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return f"Builder Error: {str(e)}"
 
 def process_and_store_email(email_metadata: dict, email_body: str):
     """
