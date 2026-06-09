@@ -138,6 +138,11 @@ def get_labels(user_email: str) -> list:
                     time.sleep(2 ** attempt)
                     continue
                 raise e
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise e
 
         detailed_labels = []
         for l in labels:

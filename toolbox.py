@@ -516,10 +516,17 @@ def perform_batch_classification(user_email: str):
         model = GenerativeModel("gemini-3.5-flash")
 
         for email in unclassified:
+            attempts = email.get("classification_attempts", 0)
+            
+            # Global decay penalty: 0.00, 0.05, 0.10 based on strikes
+            decay_penalty = attempts * 0.05
+
             new_vec = np.array(email["vector_embedding"])
             best_match_label = None
             highest_score = -1.0
-            target_threshold = config["DEFAULT_SIMILARITY_THRESHOLD"]
+            
+            # Default fallback target in case we match nothing
+            target_threshold = 0.85
 
             # --- 2a. Standard Centroid Search ---
             for lbl in labels_meta:
@@ -528,8 +535,11 @@ def perform_batch_classification(user_email: str):
                 if score > highest_score:
                     highest_score = score
                     best_match_label = lbl["label_name"]
-                    # Pattern A Relaxation: Easier to join degraded labels
-                    target_threshold = min(lbl.get("threshold_score", config["DEFAULT_SIMILARITY_THRESHOLD"]), config["DEFAULT_SIMILARITY_THRESHOLD"])
+                    
+                    # Adaptive Decay Strategy:
+                    # Target = (Label Health * 0.95) - (Attempts * 0.05)
+                    base_label_threshold = lbl.get("threshold_score", config.get("DEFAULT_SIMILARITY_THRESHOLD", 0.85)) * 0.95
+                    target_threshold = base_label_threshold - decay_penalty
 
             # --- 2b. Long-Term Memory Search (Context Enrichment) ---
             memory_json = search_user_preferences(user_email, email["vector_embedding"])
@@ -573,7 +583,7 @@ def perform_batch_classification(user_email: str):
                 
                 email_collection.update_one(
                     {"_id": email["_id"]},
-                    {"$set": {"label": final_label, "email_semantic_score": float(final_score)}}
+                    {"$set": {"label": final_label, "email_semantic_score": float(final_score), "classification_attempts": 0}}
                 )
                 try:
                     apply_label_to_email(user_email, gmail_id, label_id)
@@ -581,7 +591,15 @@ def perform_batch_classification(user_email: str):
                         remove_label_from_email(user_email, gmail_id, unclassified_id)
                     incremental_update_label_integrity(user_email, final_label, email["vector_embedding"])
                     match_count += 1
-                except: continue
+                except Exception as apply_err:
+                    print(f"[!] SILENT FAILURE during Gmail apply for {gmail_id}: {str(apply_err)}")
+                    continue
+            else:
+                # Strike System: Increment attempts if not classified
+                email_collection.update_one(
+                    {"_id": email["_id"]},
+                    {"$inc": {"classification_attempts": 1}}
+                )
         
         res_msg = f"Stable classification complete. Categorized {match_count} emails."
         

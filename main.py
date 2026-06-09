@@ -338,7 +338,7 @@ async def update_settings(request: Request):
         return {"status": "error", "message": str(e)}
 
 @app.post("/api/sync-historical")
-async def sync_historical(request: Request):
+async def sync_historical(request: Request, background_tasks: BackgroundTasks):
     """
     Triggers a manual sync of emails for a specific time range.
     Supports 'lookback_days' or 'lookback_minutes'.
@@ -357,13 +357,41 @@ async def sync_historical(request: Request):
         else:
             days = lookback_days or 30
             print(f"[*] MANUAL HISTORICAL SYNC STARTING for {user_email} (Lookback: {days} days)")
-            # Standard historical sync logic (placeholder for full background job)
-            msg = f"Historical sync for last {days} days triggered!"
+            from toolbox import sync_by_time_range
+            # Convert days to minutes for sync_by_time_range
+            total_minutes = int(days) * 24 * 60
+            processed = sync_by_time_range(user_email, minutes=total_minutes)
+            msg = f"Historical sync for last {days} days complete. Processed {processed} emails."
         
-        # Trigger an immediate reorg and batch classification to clear backlog
-        demolish_weak_labels(user_email)
-        perform_batch_classification(user_email)
-        
+        import asyncio
+        async def persistent_classification_loop(user_email):
+            """Resilient background loop to clear unclassified backlog in safe chunks."""
+            from toolbox import perform_batch_classification, get_collection
+            email_collection = get_collection()
+
+            # Max 10 iterations to prevent runaway loops (10 batches * 10 emails = 100 emails)
+            for _ in range(10):
+                result = perform_batch_classification(user_email)
+
+                # Check remaining unclassified with strike counter < 3
+                remaining = email_collection.count_documents({
+                    "user_email": user_email, 
+                    "label": "unclassified",
+                    "$or": [
+                        {"classification_attempts": {"$lt": 3}},
+                        {"classification_attempts": {"$exists": False}}
+                    ]
+                })
+
+                if remaining == 0 or "Error" in str(result):
+                    break
+
+                # Safe breathing time for Free Tier cluster
+                await asyncio.sleep(5)
+
+        # Trigger the persistent loop in the background
+        background_tasks.add_task(persistent_classification_loop, user_email)
+
         return {"status": "success", "message": msg}
     except Exception as e:
         print(f"Historical Sync Error: {str(e)}")

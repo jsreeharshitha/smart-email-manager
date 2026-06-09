@@ -11,9 +11,9 @@ def get_client():
         _mongo_client = MongoClient(
             settings.MONGO_URI, 
             server_api=ServerApi('1'),
-            connectTimeoutMS=10000, 
-            socketTimeoutMS=10000,
-            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=30000, 
+            socketTimeoutMS=30000,
+            serverSelectionTimeoutMS=30000,
             retryWrites=True,
             retryReads=True,
             maxPoolSize=10
