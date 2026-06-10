@@ -312,15 +312,33 @@ def incremental_update_label_integrity(user_email: str, label_name: str, new_emb
         threshold = meta.get("threshold_score", 0.75) # Default to 75%
         if new_integrity < threshold:
             print(f"LABEL DEGRADED: {label_name} ({new_integrity} < {threshold}). Triggering Disciplined Reorg...")
-            email_collection.update_many(
-                {"user_email": user_email, "label": label_name},
-                {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
-            )
-            publisher = pubsub_v1.PublisherClient()
-            project_id = os.getenv("PROJECT_ID", "grah-2026")
-            topic_path = publisher.topic_path(project_id, "reorganize-inbox")
-            message_data = json.dumps({"user_email": user_email, "reason": f"degraded_{label_name}"})
-            publisher.publish(topic_path, message_data.encode("utf-8"))
+            
+            # --- INFINITE LOOP GUARD ---
+            # Do not publish a new Pub/Sub message if we are already in a Reorg Cooldown
+            session_collection = get_client()[settings.DB_NAME]["UserSessions"]
+            session = session_collection.find_one({"user_email": user_email})
+            
+            config = get_user_settings(user_email)
+            cooldown_hours = config.get("REORG_COOLDOWN_HOURS", 1)
+            
+            is_cooldown_active = False
+            if session and "last_reorganized_at" in session:
+                last_reorg = datetime.fromisoformat(session["last_reorganized_at"])
+                if datetime.now(UTC) - last_reorg < timedelta(hours=cooldown_hours):
+                    is_cooldown_active = True
+                    
+            if not is_cooldown_active:
+                email_collection.update_many(
+                    {"user_email": user_email, "label": label_name},
+                    {"$set": {"label": "unclassified", "email_semantic_score": 0.0}}
+                )
+                publisher = pubsub_v1.PublisherClient()
+                project_id = os.getenv("PROJECT_ID", "grah-2026")
+                topic_path = publisher.topic_path(project_id, "reorganize-inbox")
+                message_data = json.dumps({"user_email": user_email, "reason": f"degraded_{label_name}"})
+                publisher.publish(topic_path, message_data.encode("utf-8"))
+            else:
+                print(f"[*] Reorg trigger suppressed: Cooldown is active for {user_email}.")
             
         return new_integrity
         

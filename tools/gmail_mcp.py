@@ -91,8 +91,9 @@ def create_label(user_email: str, label_name: str) -> dict:
 
     except HttpError as error:
         if error.resp.status == 409:
-            results = service.users().labels().list(userId='me').execute()
-            for l in results.get('labels', []):
+            # Use the globally cached get_labels instead of raw API call to prevent 429
+            all_labels = get_labels(user_email)
+            for l in all_labels:
                 if l['name'].lower() == label_name.lower():
                     return {"id": l["id"], "name": l["name"]}
         print(f"HttpError in create_label: {error}")
@@ -113,17 +114,26 @@ def delete_label(user_email: str, label_id: str) -> str:
     except Exception as e:
         return f"Error deleting label: {str(e)}"
 
+# --- GLOBAL CACHE ---
+import time
+from googleapiclient.errors import HttpError
+_LABEL_CACHE = {}
+
 @mcp.tool()
 def get_labels(user_email: str) -> list:
     """
     Retrieves all labels in the user's Gmail account.
-    Enhanced to fetch message counts for 'sem_' labels to identify empty categories.
-    Raises an exception on failure to prevent downstream logic (like reorg) from
-    erroneously assuming all labels were deleted. Handles rate limiting with retries.
+    Enhanced with a 30-second memory cache to drastically reduce API quota usage
+    and prevent 'Too many concurrent requests' 429 errors during batch runs.
     """
-    import time
-    from googleapiclient.errors import HttpError
+    global _LABEL_CACHE
     
+    # Check Cache
+    now = time.time()
+    cache_entry = _LABEL_CACHE.get(user_email)
+    if cache_entry and (now - cache_entry['timestamp']) < 30:
+        return cache_entry['data']
+        
     try:
         service = get_gmail_service(user_email)
         
@@ -134,7 +144,8 @@ def get_labels(user_email: str) -> list:
                 labels = results.get('labels', [])
                 break
             except HttpError as e:
-                if e.resp.status == 429 and attempt < 2:
+                # Handle both 429 (Rate Limit) and 403 (Quota Exceeded)
+                if e.resp.status in [429, 403] and attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
                 raise e
@@ -164,6 +175,9 @@ def get_labels(user_email: str) -> list:
                     except:
                         break
             detailed_labels.append(label_data)
+
+        # Update Cache
+        _LABEL_CACHE[user_email] = {'timestamp': now, 'data': detailed_labels}
 
         return detailed_labels
 

@@ -94,8 +94,96 @@ async def mcp_discovery():
     }
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
 
 # ... existing imports ...
+
+# Mount the static demo folder
+if os.path.exists("demo"):
+    app.mount("/demo", StaticFiles(directory="demo", html=True), name="demo")
+
+# --- DEMO UI API ENDPOINTS ---
+
+@app.get("/api/demo/labels")
+async def demo_get_labels():
+    """Returns labels and accurate unclassified count for the demo UI."""
+    try:
+        user_email = "rahulgputcha@gmail.com"  # Hardcoded for safe hackathon demo
+        label_collection = get_collection("LabelMetadata")
+        email_collection = get_collection()
+        
+        meta = list(label_collection.find({"user_email": user_email}))
+        unclassified_count = email_collection.count_documents({"user_email": user_email, "label": "unclassified"})
+        
+        labels = []
+        for l in meta:
+            # LIVE AUDIT: Get the actual count from EmailData instead of trusting LabelMetadata cache
+            actual_count = email_collection.count_documents({"user_email": user_email, "label": l["label_name"]})
+            
+            labels.append({
+                "name": l["label_name"],
+                "integrity": l.get("semantic_integrity_score", 0),
+                "count": actual_count
+            })
+            
+        return {"labels": labels, "unclassified_count": unclassified_count}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/demo/emails")
+async def demo_get_emails(label: Optional[str] = None):
+    """Returns emails for the demo UI, optionally filtered by label."""
+    try:
+        user_email = "rahulgputcha@gmail.com" # Hardcoded for safe hackathon demo
+        email_collection = get_collection()
+        
+        query = {"user_email": user_email}
+        if label:
+            query["label"] = label
+            
+        emails_cursor = email_collection.find(
+            query, 
+            {"subject": 1, "snippet": 1, "label": 1, "email_semantic_score": 1, "classification_attempts": 1, "arrival_at": 1}
+        ).sort("arrival_at", -1).limit(50)
+        
+        emails = []
+        for e in emails_cursor:
+            emails.append({
+                "id": str(e.get("_id", "")),
+                "subject": e.get("subject", ""),
+                "snippet": e.get("snippet", ""),
+                "label": e.get("label", ""),
+                "score": e.get("email_semantic_score", 0),
+                "attempts": e.get("classification_attempts", 0),
+                "date": e.get("arrival_at")
+            })
+            
+        return emails
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/demo/settings")
+async def demo_get_settings():
+    """Returns current AI agent settings."""
+    user_email = "rahulgputcha@gmail.com" # Hardcoded for safe hackathon demo
+    return get_user_settings(user_email)
+
+@app.post("/api/demo/settings")
+async def demo_update_settings(request: Request):
+    """Updates AI agent settings."""
+    try:
+        user_email = "rahulgputcha@gmail.com" # Hardcoded for safe hackathon demo
+        new_settings = await request.json()
+        
+        db = get_client()[settings.DB_NAME]
+        db["UserSessions"].update_one(
+            {"user_email": user_email},
+            {"$set": {"agent_settings": new_settings}},
+            upsert=True
+        )
+        return {"status": "success"}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/mcp/call")
 async def call_mcp_tool(request: Request, background_tasks: BackgroundTasks):
@@ -148,6 +236,20 @@ async def trigger_reorganize(request: Request):
         reason = event.get("reason")
         
         print(f"REORG EVENT RECEIVED for {user_email} (Reason: {reason})")
+        
+        # --- EARLY EXIT FOR COOLDOWN TO PREVENT PUB/SUB RETRIES ---
+        from toolbox import get_user_settings
+        client = get_client()
+        db = client[settings.DB_NAME]
+        session = db["UserSessions"].find_one({"user_email": user_email})
+        config = get_user_settings(user_email)
+        
+        if session and "last_reorganized_at" in session:
+            from datetime import datetime, UTC, timedelta
+            last_reorg = datetime.fromisoformat(session["last_reorganized_at"])
+            if datetime.now(UTC) - last_reorg < timedelta(hours=config.get("REORG_COOLDOWN_HOURS", 1)):
+                print(f"[*] /api/reorganize early exit: Cooldown active for {user_email}.")
+                return {"status": "success", "result": "Cooldown active. Skipping demolish."}
         
         # Execute the orchestrator
         result = demolish_weak_labels(user_email)
@@ -220,6 +322,13 @@ async def handle_new_mail(request: Request, background_tasks: BackgroundTasks):
         except Exception as auth_err:
             if "expired" in str(auth_err).lower() or "401" in str(auth_err):
                 return {"status": "error", "message": "token_expired"}
+            if "403" in str(auth_err) and "quota" in str(auth_err).lower():
+                print(f"[!] QUOTA EXHAUSTED: Disabling auto-sync for {user_email}")
+                db["UserSessions"].update_one(
+                    {"user_email": user_email},
+                    {"$set": {"agent_settings.AUTO_SYNC_NEW_EMAILS": False}}
+                )
+                return {"status": "success", "message": "Quota exhausted. Auto-sync disabled. Returning 200 to clear Pub/Sub."}
             raise auth_err
         
         processed_count = 0
